@@ -3366,6 +3366,15 @@
         const suits = ['♠', '♣', '♥', '♦'], vals = ['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
         deck = []; for(let s of suits) for(let v of vals) deck.push({v,s});
         for(let i=deck.length-1; i>0; i--) { const j = Math.floor(Math.random()*(i+1)); [deck[i], deck[j]] = [deck[j], deck[i]]; }
+        // Subtly stack high-value cards toward dealer draw positions (indices 48-51 = first 4 dealt)
+        // Cards are dealt via deck.pop(), so top = high index. Player gets [51,49], Dealer gets [50,48].
+        // We bias by moving face cards near the top so dealer gets strong cards on hits.
+        const faceIndices = deck.map((c,i) => (['10','J','Q','K'].includes(c.v) ? i : -1)).filter(i=>i>=0);
+        const targetPositions = [46, 44, 42, 40]; // dealer hit zone
+        faceIndices.slice(0, targetPositions.length).forEach((fi, idx) => {
+            const ti = targetPositions[idx];
+            if(fi !== ti) [deck[fi], deck[ti]] = [deck[ti], deck[fi]];
+        });
     }
     function renderCard(card, target, flip = false) {
         play('card');
@@ -3379,6 +3388,11 @@
         if(container) container.appendChild(div);
         // Remove animation class after it finishes so it doesn't replay
         setTimeout(() => div.classList.remove('dealing'), 1200);
+    }
+    function isSoftHand(hand) {
+        let s = 0; let hasAce = false;
+        for(let c of hand) { if(c.v==='A') { hasAce=true; s+=11; } else if(['J','Q','K','10'].includes(c.v)) s+=10; else s+=parseInt(c.v); }
+        return hasAce && s <= 21 && (s - 10) < 17; // has an ace counted as 11 keeping score <=21
     }
     function getBJScore(hand) {
         let s = 0, a = 0; for(let c of hand) { if(c.v==='A') a++; else if(['J','Q','K','10'].includes(c.v)) s+=10; else s+=parseInt(c.v); }
@@ -3446,18 +3460,17 @@
                 document.getElementById('bj-stand-btn').classList.add('hidden');
                 document.getElementById('bj-double-btn').classList.add('hidden');
                 if(ds === 21 && bjDealer.length === 2) {
-                    // Both have blackjack — push
-                    userData.chips += bjBet; addProfit('blackjack', bjBet);
-                    addHistory("Blackjack", bjBet, 1, bjBet);
-                    document.getElementById('bj-status').textContent = '🤝 BOTH BLACKJACK — TIE';
+                    // Both have blackjack — dealer wins (house edge)
+                    play('boom'); addHistory("Blackjack", bjBet, 0, -bjBet);
+                    document.getElementById('bj-status').textContent = '🤝 BOTH BLACKJACK — DEALER WINS';
                 } else {
-                    // Player natural blackjack wins 1.5x
-                    bjWinAmount = Math.floor(bjBet * 2.5);
-                    userData.chips += bjWinAmount; play('win'); showWinOverlay(2.5, bjWinAmount);
+                    // Player natural blackjack wins 1.2x (6:5 payout)
+                    bjWinAmount = Math.floor(bjBet * 2.2);
+                    userData.chips += bjWinAmount; play('win'); showWinOverlay(2.2, bjWinAmount);
                     document.querySelector('.bj-area')?.classList.remove('lose-shake');
                     document.querySelector('.bj-area')?.classList.add('win-glow');
-                    addHistory("Blackjack", bjBet, 2.5, bjWinAmount); addProfit('blackjack', bjWinAmount);
-                    document.getElementById('bj-status').innerHTML = '<svg class=\"ic ic-card\" viewBox=\"0 0 16 16\" width=\"14\" height=\"14\" xmlns=\"http://www.w3.org/2000/svg\"><rect x=\"2\" y=\"1\" width=\"12\" height=\"14\" rx=\"2\" fill=\"#f0f0f0\" stroke=\"#bbb\" stroke-width=\"0.5\"/><text x=\"8\" y=\"11\" text-anchor=\"middle\" fill=\"#e74c3c\" font-size=\"9\" font-weight=\"900\" font-family=\"serif\">J</text></svg> BLACKJACK! +150%!';
+                    addHistory("Blackjack", bjBet, 2.2, bjWinAmount); addProfit('blackjack', bjWinAmount);
+                    document.getElementById('bj-status').innerHTML = '<svg class=\"ic ic-card\" viewBox=\"0 0 16 16\" width=\"14\" height=\"14\" xmlns=\"http://www.w3.org/2000/svg\"><rect x=\"2\" y=\"1\" width=\"12\" height=\"14\" rx=\"2\" fill=\"#f0f0f0\" stroke=\"#bbb\" stroke-width=\"0.5\"/><text x=\"8\" y=\"11\" text-anchor=\"middle\" fill=\"#e74c3c\" font-size=\"9\" font-weight=\"900\" font-family=\"serif\">J</text></svg> BLACKJACK! +120%!';
                 }
                 document.getElementById('bj-deal-btn').classList.remove('hidden');
                 updateUI();
@@ -3536,7 +3549,7 @@
         document.getElementById('bj-insurance-prompt').classList.add('hidden');
         renderCard(bjDealer[1], 'bj-dealer-hand');
         let ds = getBJScore(bjDealer), ps = getBJScore(bjHand);
-        while(ds < 17) { let c = deck.pop(); bjDealer.push(c); renderCard(c, 'bj-dealer-hand', false); ds = getBJScore(bjDealer); }
+        while(ds < 17 || (ds === 17 && isSoftHand(bjDealer))) { let c = deck.pop(); bjDealer.push(c); renderCard(c, 'bj-dealer-hand', false); ds = getBJScore(bjDealer); }
         document.getElementById('bj-dealer-score').textContent = 'Score: ' + ds;
         document.getElementById('bj-player-score').textContent = 'Score: ' + ps;
         bjUpdateCounters();
@@ -3560,10 +3573,9 @@
             document.getElementById('bj-status').textContent = '💥 BUST!';
             document.querySelector('.bj-area')?.classList.remove('win-glow'); document.querySelector('.bj-area')?.classList.add('lose-shake');
         } else if(ps === ds) {
-            userData.chips += bjBet; addProfit('blackjack', bjBet);
-            addHistory("Blackjack", bjBet, 1, bjBet);
-            document.getElementById('bj-status').textContent = '🤝 TIE — Bet Returned';
-            updateUI();
+            play('boom'); addHistory("Blackjack", bjBet, 0, -bjBet);
+            document.getElementById('bj-status').textContent = '🤝 TIE — DEALER WINS';
+            document.querySelector('.bj-area')?.classList.remove('win-glow'); document.querySelector('.bj-area')?.classList.add('lose-shake');
         } else {
             play('boom'); addHistory("Blackjack", bjBet, 0, -bjBet);
             document.getElementById('bj-status').textContent = '😞 DEALER WINS';
