@@ -1883,6 +1883,7 @@
     const DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1475155012266098688/gN9IvDw1VACuP9wrUJ6jjpxsfbyTC0_laPXcSI4OE1s9wIlbhFN58XoEpnju-TNm-uZb";
     
     let currentUser = localStorage.getItem('swarm_user');
+    let _realUserData = null; // Always points to the plain Firebase object (no Proxy)
     let userData = null;
     let betHistory = [];  // loaded per user in loginSuccess
     let audioReady = false;
@@ -2072,21 +2073,10 @@
         if (typeof userData.chips !== 'number' || isNaN(userData.chips) || !isFinite(userData.chips)) {
             userData.chips = 0;
         }
+        _realUserData = userData; // point to plain object before any wrapping
 
-        // ── Free Play Proxy: transparently route .chips reads/writes ──
-        // Store the real underlying data object so we can still save it
-        const _realData = userData;
-        userData = new Proxy(_realData, {
-            get(target, key) {
-                if(key === 'chips' && fpEnabled) return fpChips;
-                return target[key];
-            },
-            set(target, key, value) {
-                if(key === 'chips' && fpEnabled) { fpChips = value; return true; }
-                target[key] = value;
-                return true;
-            }
-        });
+        // ── Store reference to real data for Firebase saves ──
+        _realUserData = userData;
 
         document.getElementById('auth-screen').classList.add('hidden');
         document.getElementById('main-app').classList.remove('hidden');
@@ -2100,14 +2090,33 @@
         // Restore any active game session that was interrupted
         restoreGameState();
         // Start anticheat after a brief delay (let updateUI settle)
-        setTimeout(() => acInit(userData.chips), 1500);
+        setTimeout(() => acInit(_realUserData ? _realUserData.chips : userData.chips), 1500);
+        // ── Live balance polling: refresh from Firebase every 12s ──
+        if (window._balancePollTimer) clearInterval(window._balancePollTimer);
+        window._balancePollTimer = setInterval(async () => {
+            if (!currentUser || fpEnabled) return;
+            try {
+                const r = await fetch(`${DB_URL}/${currentUser}.json`);
+                const fresh = await r.json();
+                if (fresh && typeof fresh.chips === 'number' && isFinite(fresh.chips)) {
+                    // Only update if balance changed (admin deposit/withdraw)
+                    const cur = _realUserData ? _realUserData.chips : 0;
+                    if (fresh.chips !== cur) {
+                        if (_realUserData) _realUserData.chips = fresh.chips;
+                        if (userData) userData.chips = fresh.chips;
+                        if (_acEnabled) acLegitChange(fresh.chips);
+                        updateUI();
+                    }
+                }
+            } catch(e) {}
+        }, 12000);
         // Tower risk change → rebuild board preview
         document.getElementById('t-risk')?.addEventListener('change', function() {
             if(!tActive) { tCurrentRisk = this.value; buildTowerBoard(); }
         });
     }
 
-    function logout() { localStorage.removeItem('swarm_user'); clearGameState(null); betHistory = []; location.reload(); }
+    function logout() { if(window._balancePollTimer) clearInterval(window._balancePollTimer); localStorage.removeItem('swarm_user'); clearGameState(null); betHistory = []; location.reload(); }
 
     // ══════════════════════════════════════════════════════════════════
     // GAME STATE PERSISTENCE  (survive page refresh)
@@ -2339,7 +2348,7 @@
         const nameEl = document.getElementById('home-display-name');
         const chipsEl = document.getElementById('home-display-chips');
         if(nameEl) nameEl.innerText = (userData && userData.displayName) ? userData.displayName : currentUser || '---';
-        if(chipsEl) chipsEl.innerText = userData ? Math.floor(userData.chips) : 0;
+        if(chipsEl) chipsEl.innerText = Math.floor(getChips());
 
         // Stats from bet history (win > 0 means won, negative = lost)
         const total = betHistory.length;
@@ -2417,7 +2426,7 @@
 
     function updateUI() {
         if(!userData) return;
-        const rawChips = fpEnabled ? fpChips : userData.chips;
+        const rawChips = fpEnabled ? fpChips : (_realUserData ? _realUserData.chips : (userData ? userData.chips : 0));
         const chips = (typeof rawChips === 'number' && isFinite(rawChips)) ? Math.floor(rawChips) : 0;
         const el = document.getElementById('display-chips');
         if(el && el.innerText !== String(chips)) {
@@ -2433,8 +2442,8 @@
             return; // Don't save to Firebase or run anticheat in FP mode
         }
         // Sync anticheat snapshot on every legitimate updateUI call
-        if(_acEnabled) acLegitChange(userData.chips);
-        fetch(`${DB_URL}/${currentUser}.json`, { method: 'PUT', body: JSON.stringify(userData) });
+        if(_acEnabled) acLegitChange(_realUserData ? _realUserData.chips : userData.chips);
+        fetch(`${DB_URL}/${currentUser}.json`, { method: 'PUT', body: JSON.stringify(_realUserData) });
 
         // Dim FP button when any game is active (prevents confusion)
         const fpBtn = document.getElementById('fp-topbtn');
@@ -2451,13 +2460,19 @@
     // --- GAME ENGINE WRAPPERS ---
     // FP-aware balance helpers
     function getChips() {
-        const v = fpEnabled ? fpChips : userData.chips;
+        if (fpEnabled) return (typeof fpChips === 'number' && isFinite(fpChips)) ? fpChips : 0;
+        const v = _realUserData ? _realUserData.chips : (userData ? userData.chips : 0);
         return (typeof v === 'number' && isFinite(v)) ? v : 0;
     }
-    function setChips(v) { if(fpEnabled) { fpChips = v; } else { userData.chips = v; } }
+    function setChips(v) {
+        const safe = (typeof v === 'number' && isFinite(v)) ? v : 0;
+        if (fpEnabled) { fpChips = safe; }
+        else { if (_realUserData) _realUserData.chips = safe; if (userData) userData.chips = safe; }
+    }
     function addChips(v) {
         const safe = (typeof v === 'number' && isFinite(v)) ? v : 0;
-        if (fpEnabled) { fpChips += safe; } else { userData.chips = (getChips() + safe); }
+        if (fpEnabled) { fpChips += safe; }
+        else { const cur = getChips(); setChips(cur + safe); }
     }
     function selectGame(g) {
         document.getElementById('selection-menu').classList.add('hidden');
@@ -2591,7 +2606,7 @@
             label.innerText = 'Free Play';
             if(balBox) { balBox.style.borderColor = ''; balBox.title = 'How to get coins?'; }
             // Resync anticheat snapshot so it doesn't false-trigger
-            if(typeof _acEnabled !== 'undefined' && _acEnabled && userData) acLegitChange(userData.chips);
+            if(typeof _acEnabled !== 'undefined' && _acEnabled && _realUserData) acLegitChange(_realUserData.chips);
         }
         updateUI();
     }
@@ -2661,7 +2676,7 @@
         if(data && data.val) {
             // Mark as used
             await fetch(usedKey, { method: 'PUT', body: JSON.stringify({ by: currentUser, at: Date.now() }) });
-            userData.chips += data.val; updateUI();
+            addChips(data.val); updateUI();
             toast('✅ Code redeemed! +' + data.val + ' ★', 'success');
         } else {
             toast('Invalid or expired code!', 'error');
@@ -2686,7 +2701,7 @@
         const oldChips = tData.chips || 0;
         tData.chips = oldChips + amount;
         await fetch(`${DB_URL}/${target}.json`, { method: 'PUT', body: JSON.stringify(tData) });
-        if(target === currentUser) { userData.chips = tData.chips; updateUI(); }
+        if(target === currentUser) { if(_realUserData) _realUserData.chips = tData.chips; userData.chips = tData.chips; if(_acEnabled) acLegitChange(tData.chips); updateUI(); }
         
         // Log to Discord
         const adminName = userData?.username || userData?.discordName || currentUser || "Unknown Admin";
@@ -2712,7 +2727,7 @@
         const oldBal = tData.chips || 0;
         tData.chips = newBal;
         await fetch(`${DB_URL}/${target}.json`, { method: 'PUT', body: JSON.stringify(tData) });
-        if(target === currentUser) { userData.chips = newBal; updateUI(); }
+        if(target === currentUser) { if(_realUserData) _realUserData.chips = newBal; userData.chips = newBal; if(_acEnabled) acLegitChange(newBal); updateUI(); }
         
         // Log to Discord
         const adminName = userData?.username || userData?.discordName || currentUser || "Unknown Admin";
@@ -2762,7 +2777,10 @@
         
         // Update UI if it's current user
         if(target === currentUser) {
-            userData.chips = newBalance;
+            if (_realUserData) _realUserData.chips = newBalance;
+            if (_realUserData) _realUserData.chips = newBalance;
+            if (userData) userData.chips = newBalance;
+            if (_acEnabled) acLegitChange(newBalance);
             updateUI();
         }
         
@@ -2830,7 +2848,10 @@
         
         // Update UI if it's current user
         if(target === currentUser) {
-            userData.chips = newBalance;
+            if (_realUserData) _realUserData.chips = newBalance;
+            if (_realUserData) _realUserData.chips = newBalance;
+            if (userData) userData.chips = newBalance;
+            if (_acEnabled) acLegitChange(newBalance);
             updateUI();
         }
         
@@ -2902,10 +2923,10 @@
         if(!acquireBetLock()) return;
         mBet = clampBet(document.getElementById('m-bet').value);
         document.getElementById('m-bet').value = mBet;
-        if(mBet > userData.chips || mBet < MIN_BET) { toast('Not enough ★! Min bet: ' + MIN_BET, 'error'); releaseBetLock(); return; }
+        if(mBet > getChips() || mBet < MIN_BET) { toast('Not enough ★! Min bet: ' + MIN_BET, 'error'); releaseBetLock(); return; }
         const risk = document.getElementById('m-risk').value;
         const bombCount = mRiskMines[risk][mGridSize];
-        countGame(); userData.chips -= mBet; mActive = true; mMult = 1; mBombs = []; mGemsFound = 0; updateUI();
+        countGame(); addChips(-mBet); mActive = true; mMult = 1; mBombs = []; mGemsFound = 0; updateUI();
         if(mRevealTimeout) { clearTimeout(mRevealTimeout); mRevealTimeout = null; }
         addProfit('mines', -mBet);
         releaseBetLock();
@@ -2948,7 +2969,7 @@
     function cashoutMines() {
         if(!mActive) return;
         let win = Math.floor(mBet * mMult);
-        userData.chips += win; play('win');
+        addChips(win); play('win');
         showWinOverlay(mMult, win);
         addHistory("Mines", mBet, mMult, win); clearGameState('mines');
         addProfit('mines', win);
@@ -2986,8 +3007,8 @@
         let b = clampBet(document.getElementById('d-bet').value);
         document.getElementById('d-bet').value = b;
         let n = parseInt(document.getElementById('d-num').value);
-        if(b > userData.chips) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
-        countGame(); userData.chips -= b; addProfit('dice', -b); updateUI();
+        if(b > getChips()) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
+        countGame(); addChips(-b); addProfit('dice', -b); updateUI();
         const btn = document.querySelector('#game-dice .btn-play');
         if(btn) btn.disabled = true;
         setTimeout(() => {
@@ -3003,7 +3024,7 @@
         return '<svg viewBox="0 0 80 80" width="80" height="80"><rect x="5" y="5" width="70" height="70" rx="14" fill="#1a4db5" stroke="#4d80ff" stroke-width="2.5"/>'+ps.map(p=>'<circle cx="'+p[0]+'" cy="'+p[1]+'" r="7" fill="#4d80ff"/>').join('')+'</svg>';
     })(r);
             if(r === n) {
-                let win = b*6; userData.chips += win; play('win');
+                let win = b*6; addChips(win); play('win');
                 showWinOverlay(6.00, win); addHistory("Dice", b, 6, win); addProfit('dice', win);
                 toast('Rolled ' + r + '! You win +' + win + ' ★', 'success');
             } else {
@@ -3021,8 +3042,8 @@
         let b = clampBet(document.getElementById('cf-bet').value), choice = document.getElementById('cf-choice').value;
         document.getElementById('cf-bet').value = b;
         let btn = document.getElementById('cf-btn'), coin = document.getElementById('coin-obj');
-        if(b > userData.chips || b < MIN_BET) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
-        countGame(); userData.chips -= b; addProfit('coinflip', -b); updateUI(); btn.disabled = true; coin.classList.add('flipping');
+        if(b > getChips() || b < MIN_BET) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
+        countGame(); addChips(-b); addProfit('coinflip', -b); updateUI(); btn.disabled = true; coin.classList.add('flipping');
         setTimeout(() => {
             coin.classList.remove('flipping');
             let res = houseEdge() ? (choice === 'H' ? 'T' : 'H') : (Math.random() < 0.5 ? choice : (choice === 'H' ? 'T' : 'H')); coin.innerHTML = (res === 'H') ? `<svg viewBox="0 0 80 80" width="60" height="60" xmlns="http://www.w3.org/2000/svg">
@@ -3042,7 +3063,7 @@
   <polygon points="40,18 45,30 57,30.5 48,38.5 51,51 40,44 29,51 32,38.5 23,30.5 35,30" fill="#f1c40f"/>
 </svg>`;
             if(res === choice) {
-                let win = b*2; userData.chips += win; play('win');
+                let win = b*2; addChips(win); play('win');
                 showWinOverlay(2.0, win); addHistory("CoinFlip", b, 2, win); addProfit('coinflip', win);
                 toast((res==='H'?'👑 Heads':'★ Tails') + '! You win +' + win + ' ★', 'success');
             } else {
@@ -3059,8 +3080,8 @@
         if(!acquireBetLock()) return;
         crashBet = clampBet(document.getElementById('c-bet').value);
         document.getElementById('c-bet').value = crashBet;
-        if (crashBet > userData.chips || crashBet < MIN_BET || crashActive) { releaseBetLock(); return; }
-        countGame(); userData.chips -= crashBet; addProfit('crash', -crashBet); updateUI(); crashActive = true; crashMult = 1.00;
+        if (crashBet > getChips() || crashBet < MIN_BET || crashActive) { releaseBetLock(); return; }
+        countGame(); addChips(-crashBet); addProfit('crash', -crashBet); updateUI(); crashActive = true; crashMult = 1.00;
         const display = document.getElementById('crash-display'); display.style.color = "white";
         document.getElementById('c-start').disabled = true; document.getElementById('c-cash').classList.remove('hidden');
         let crashPoint = houseEdge() ? 1.00 : (0.99 / (1 - Math.random()));
@@ -3080,7 +3101,7 @@
     function cashoutCrash() {
         if (!crashActive) return;
         clearInterval(crashInterval); crashActive = false;
-        let win = Math.floor(crashBet * crashMult); userData.chips += win;
+        let win = Math.floor(crashBet * crashMult); addChips(win);
         play('win'); showWinOverlay(crashMult, win); addHistory("Crash", crashBet, crashMult, win);
         addProfit('crash', win);
         toast('✈️ Cashed out at ' + crashMult.toFixed(2) + 'x! +' + win + ' ★', 'success');
@@ -3105,13 +3126,13 @@
     function setExtraBet(type, el) {
         if(isRSpinning) return; const amt = clampBet(document.getElementById('r-bet').value);
         document.getElementById('r-bet').value = amt;
-        if(amt > userData.chips) return; if(!currentBets[type]) currentBets[type] = 0;
-        currentBets[type] += amt; userData.chips -= amt; updateUI(); saveGameState();
+        if(amt > getChips()) return; if(!currentBets[type]) currentBets[type] = 0;
+        currentBets[type] += amt; addChips(-amt); updateUI(); saveGameState();
         let chip = el.querySelector('.chip-overlay'); if(!chip) { chip = document.createElement('div'); chip.className = 'chip-overlay'; el.appendChild(chip); }
         chip.innerText = currentBets[type]; el.classList.add('active');
     }
     function clearRouletteBets() {
-        if(isRSpinning) return; let refund = 0; for(let key in currentBets) { refund += currentBets[key]; userData.chips += currentBets[key]; } clearGameState('roulette');
+        if(isRSpinning) return; let refund = 0; for(let key in currentBets) { refund += currentBets[key]; addChips(currentBets[key]); } clearGameState('roulette');
         // Don't call addProfit here — we're just refunding chips, not a game outcome
         currentBets = {}; document.querySelectorAll('.cell, .btn-extra').forEach(el => { el.classList.remove('active'); const c = el.querySelector('.chip-overlay'); if(c) c.remove(); }); updateUI();
     }
@@ -3170,7 +3191,7 @@
                 else if(b === '3rd12' && actualNum >= 25 && actualNum <= 36) totalWin += amt * 3;
             }
             document.getElementById('r-status').innerText = `Landed: ${actualNum} ${redNums.includes(actualNum) ? '🔴' : actualNum === 0 ? '🟢' : '⚫'}`;
-            if(totalWin > 0) { userData.chips += totalWin; play('win'); showWinOverlay(totalWin/totalBet, totalWin); addHistory("Roulette", totalBet, totalWin/totalBet, totalWin); addProfit('roulette', totalWin - totalBet); }
+            if(totalWin > 0) { addChips(totalWin); play('win'); showWinOverlay(totalWin/totalBet, totalWin); addHistory("Roulette", totalBet, totalWin/totalBet, totalWin); addProfit('roulette', totalWin - totalBet); }
             else { play('boom'); addHistory("Roulette", totalBet, 0, -totalBet); addProfit('roulette', -totalBet); }
             currentBets = {}; clearGameState('roulette'); document.querySelectorAll('.cell, .btn-extra').forEach(el => { el.classList.remove('active'); const c = el.querySelector('.chip-overlay'); if(c) c.remove(); });
             isRSpinning = false; document.getElementById('r-spin').disabled = false; updateUI();
@@ -3247,9 +3268,9 @@
         if(!acquireBetLock()) return;
         tBet = clampBet(document.getElementById('t-bet').value);
         document.getElementById('t-bet').value = tBet;
-        if(tBet > userData.chips || tBet < MIN_BET) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
+        if(tBet > getChips() || tBet < MIN_BET) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
         tCurrentRisk = document.getElementById('t-risk').value;
-        countGame(); userData.chips -= tBet; addProfit('tower', -tBet); updateUI();
+        countGame(); addChips(-tBet); addProfit('tower', -tBet); updateUI();
         releaseBetLock();
         tActive = true; tLevel = 0;
         document.getElementById('t-start').disabled = true;
@@ -3360,7 +3381,7 @@
         if(!tActive) return;
         const m = tGetMults()[tLevel - 1];
         const win = Math.floor(tBet * m);
-        userData.chips += win; play('win');
+        addChips(win); play('win');
         showWinOverlay(m, win);
         addHistory("Tower", tBet, m, win); clearGameState('tower');
         addProfit('tower', win);
@@ -3425,8 +3446,8 @@
         if(!acquireBetLock()) return;
         bjBet = clampBet(document.getElementById('bj-bet').value);
         document.getElementById('bj-bet').value = bjBet;
-        if(bjBet > userData.chips) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
-        countGame(); userData.chips -= bjBet; addProfit('blackjack', -bjBet); updateUI(); bjActive=true; createDeck(); bjWinAmount=0; bjInsurance=0;
+        if(bjBet > getChips()) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
+        countGame(); addChips(-bjBet); addProfit('blackjack', -bjBet); updateUI(); bjActive=true; createDeck(); bjWinAmount=0; bjInsurance=0;
         releaseBetLock();
         bjHand = [deck.pop(), deck.pop()]; bjDealer = [deck.pop(), deck.pop()];
         document.getElementById('bj-player-hand').innerHTML = ''; document.getElementById('bj-dealer-hand').innerHTML = '';
@@ -3454,7 +3475,7 @@
     function bjShowActionButtons() {
         document.getElementById('bj-hit-btn').classList.remove('hidden');
         document.getElementById('bj-stand-btn').classList.remove('hidden');
-        if(userData.chips >= bjBet && bjHand.length === 2) {
+        if(getChips() >= bjBet && bjHand.length === 2) {
             document.getElementById('bj-double-btn').classList.remove('hidden');
         }
     }
@@ -3504,7 +3525,7 @@
                 } else {
                     // Player natural blackjack wins 1.2x (6:5 payout)
                     bjWinAmount = Math.floor(bjBet * 2.2);
-                    userData.chips += bjWinAmount; play('win'); showWinOverlay(2.2, bjWinAmount);
+                    addChips(bjWinAmount); play('win'); showWinOverlay(2.2, bjWinAmount);
                     document.querySelector('.bj-area')?.classList.remove('lose-shake');
                     document.querySelector('.bj-area')?.classList.add('win-glow');
                     addHistory("Blackjack", bjBet, 2.2, bjWinAmount); addProfit('blackjack', bjWinAmount);
@@ -3517,9 +3538,9 @@
     }
     function bjTakeInsurance() {
         const insAmt = Math.floor(bjBet / 2);
-        if(userData.chips < insAmt) { toast('Not enough ★ for insurance!', 'error'); return; }
+        if(getChips() < insAmt) { toast('Not enough ★ for insurance!', 'error'); return; }
         bjInsurance = insAmt;
-        userData.chips -= bjInsurance; addProfit('blackjack', -bjInsurance); updateUI();
+        addChips(-bjInsurance); addProfit('blackjack', -bjInsurance); updateUI();
         toast(`Insured for ${insAmt} ★!`, 'success');
         document.getElementById('bj-insurance-prompt').classList.add('hidden');
         bjAfterInsuranceDecision();
@@ -3541,14 +3562,14 @@
             if(bjInsurance > 0) {
                 // Insurance pays 2:1
                 const insPayout = bjInsurance * 3; // get back stake + 2x
-                userData.chips += insPayout; addProfit('blackjack', insPayout);
+                addChips(insPayout); addProfit('blackjack', insPayout);
                 toast(`Insurance pays ${insPayout} ★!`, 'success');
             }
             // Check if player also has blackjack
             const playerBJ = getBJScore(bjHand) === 21 && bjHand.length === 2;
             if(playerBJ) {
                 // Push on main bet
-                userData.chips += bjBet; addProfit('blackjack', bjBet);
+                addChips(bjBet); addProfit('blackjack', bjBet);
                 addHistory("Blackjack", bjBet, 1, bjBet);
                 msg = bjInsurance > 0 ? '🛡️ INSURED + TIE!' : '🤝 BOTH BLACKJACK — TIE';
             } else {
@@ -3649,14 +3670,14 @@
         // Check for 5-card 21 (automatic win with bonus)
         if(ps === 21 && bjHand.length >= 5) {
             bjWinAmount = bjBet * 2.5; // 2.5x payout for 5-card 21
-            userData.chips += bjWinAmount; play('win'); showWinOverlay(2.5, bjWinAmount);
+            addChips(bjWinAmount); play('win'); showWinOverlay(2.5, bjWinAmount);
             document.querySelector('.bj-area')?.classList.remove('lose-shake'); document.querySelector('.bj-area')?.classList.add('win-glow');
             addHistory("Blackjack", bjBet, 2.5, bjWinAmount); addProfit('blackjack', bjWinAmount);
             document.getElementById('bj-status').textContent = '🌟 5-CARD 21! YOU WIN!';
         } else if(ps <= 21 && (ds > 21 || ps > ds)) {
             // Player wins
             bjWinAmount = bjBet*2;
-            userData.chips += bjWinAmount; play('win'); showWinOverlay(2, bjWinAmount);
+            addChips(bjWinAmount); play('win'); showWinOverlay(2, bjWinAmount);
             document.querySelector('.bj-area')?.classList.remove('lose-shake'); document.querySelector('.bj-area')?.classList.add('win-glow');
             addHistory("Blackjack", bjBet, 2, bjWinAmount); addProfit('blackjack', bjWinAmount);
             document.getElementById('bj-status').textContent = '🏆 YOU WIN!';
@@ -3681,9 +3702,9 @@
     }
     function bjDouble() {
         if(!bjActive || bjHand.length !== 2) return;
-        if(userData.chips < bjBet) { toast('Not enough ★ to double!', 'error'); return; }
+        if(getChips() < bjBet) { toast('Not enough ★ to double!', 'error'); return; }
         // Deduct the extra bet
-        userData.chips -= bjBet;
+        addChips(-bjBet);
         addProfit('blackjack', -bjBet);
         bjBet *= 2;
         updateUI();
@@ -3711,8 +3732,8 @@
         if(!acquireBetLock()) return;
         const bet = clampBet(document.getElementById('bac-bet').value);
         document.getElementById('bac-bet').value = bet;
-        if(bet > userData.chips || bet < MIN_BET) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
-        countGame(); userData.chips -= bet; addProfit('baccarat', -bet); updateUI();
+        if(bet > getChips() || bet < MIN_BET) { toast('Not enough ★!', 'error'); releaseBetLock(); return; }
+        countGame(); addChips(-bet); addProfit('baccarat', -bet); updateUI();
         releaseBetLock();
         createDeck();
         document.getElementById('bac-player-hand').innerHTML = '';
@@ -3768,7 +3789,7 @@
                     if(result === 'P') win = bet * 2;
                     else if(result === 'B') win = Math.floor(bet * 1.95);
                     else win = bet * 9;
-                    userData.chips += win; play('win'); showWinOverlay(win/bet, win); document.querySelector('.bac-table')?.classList.remove('lose-shake'); document.querySelector('.bac-table')?.classList.add('win-glow');
+                    addChips(win); play('win'); showWinOverlay(win/bet, win); document.querySelector('.bac-table')?.classList.remove('lose-shake'); document.querySelector('.bac-table')?.classList.add('win-glow');
                     addHistory("Baccarat", bet, win/bet, win); addProfit('baccarat', win);
                     document.getElementById('bac-status').innerText = `${result === 'P' ? 'PLAYER' : result === 'B' ? 'BANKER' : 'TIE'} WINS! +${win} ★`;
                 } else {
@@ -3905,8 +3926,8 @@
     function playRoyalJelly() {
         const bet = clampBet(document.getElementById('rj-bet').value);
         document.getElementById('rj-bet').value = bet;
-        if(bet > userData.chips || bet < MIN_BET) { alert('Not enough ★!'); return; }
-        countGame(); userData.chips -= bet; addProfit('royaljelly', -bet); updateUI();
+        if(bet > getChips() || bet < MIN_BET) { alert('Not enough ★!'); return; }
+        countGame(); addChips(-bet); addProfit('royaljelly', -bet); updateUI();
 
         const btn = document.getElementById('rj-spin-btn');
         btn.disabled = true;
@@ -3946,7 +3967,7 @@
             if(playerBee.coins > botBee.coins) {
                 const mult = playerBee.coins * 0.02;
                 const win = Math.floor(bet * mult);
-                userData.chips += win; play('win');
+                addChips(win); play('win');
                 showWinOverlay(mult, win);
                 addHistory("Royal Jelly", bet, mult, win);
                 addProfit('royaljelly', win);
@@ -3954,7 +3975,7 @@
                 resultEl.innerHTML = `🌹 YOUR BEE WINS! +${win} <svg class=\"ic ic-star\" viewBox=\"0 0 16 16\" width=\"13\" height=\"13\" xmlns=\"http://www.w3.org/2000/svg\"><polygon points=\"8,1 10.3,5.8 15.5,6.6 11.5,10.4 12.5,15.5 8,13.0 3.5,15.5 4.5,10.4 0.5,6.6 5.7,5.8\" fill=\"#f1c40f\" stroke=\"#c9a800\" stroke-width=\"0.4\"/></svg> <span style="color:#aaa;font-size:13px;">(bet × ${playerBee.coins} coins × 0.02 = ${mult.toFixed(2)}×)</span><br><small>${playerBee.name} (${playerBee.coins}) beats ${botBee.name} (${botBee.coins})</small>`;
             } else if(playerBee.coins === botBee.coins) {
                 const halfBet = Math.floor(bet / 2);
-                userData.chips += halfBet; addProfit('royaljelly', halfBet);
+                addChips(halfBet); addProfit('royaljelly', halfBet);
                 resultEl.className = 'rj-result';
                 resultEl.style.background = '#1a1a00'; resultEl.style.border = '2px solid #f1c40f';
                 resultEl.innerHTML = `🤝 TIE! Half bet returned: +${halfBet} <svg class=\"ic ic-star\" viewBox=\"0 0 16 16\" width=\"13\" height=\"13\" xmlns=\"http://www.w3.org/2000/svg\"><polygon points=\"8,1 10.3,5.8 15.5,6.6 11.5,10.4 12.5,15.5 8,13.0 3.5,15.5 4.5,10.4 0.5,6.6 5.7,5.8\" fill=\"#f1c40f\" stroke=\"#c9a800\" stroke-width=\"0.4\"/></svg><br><small>${playerBee.name} = ${botBee.name} (${playerBee.coins} coins each)</small>`;
@@ -4052,8 +4073,8 @@
 
     function bwBuyBeequip(bq, free=false) {
         if(!free) {
-            if(userData.chips < bq.cost) { bwLog('Not enough ★ Stars!', 'bad'); return; }
-            userData.chips -= bq.cost; updateUI();
+            if(getChips() < bq.cost) { bwLog('Not enough ★ Stars!', 'bad'); return; }
+            addChips(-bq.cost); updateUI();
         }
         bwState.beequip = bq;
         bwState.stats = bq.baseStats();
@@ -4134,15 +4155,15 @@
         // Check inventory / cost
         if(type==='soft'){ /* always free */ }
         else if(type==='hard'){
-            if(userData.chips < 2){ bwLog('Not enough ★ for Hard Wax (costs 2 ★)!','bad'); return; }
-            userData.chips -= 2; updateUI();
+            if(getChips() < 2){ bwLog('Not enough ★ for Hard Wax (costs 2 ★)!','bad'); return; }
+            addChips(-2); updateUI();
         }
         else if(type==='caustic'){
-            if(userData.chips < 20){ bwLog('Not enough ★ for Caustic Wax (costs 20 ★)!','bad'); return; }
-            userData.chips -= 20; updateUI();
+            if(getChips() < 20){ bwLog('Not enough ★ for Caustic Wax (costs 20 ★)!','bad'); return; }
+            addChips(-20); updateUI();
         } else if(type==='swirled'){
-            if(userData.chips < 20){ bwLog('Not enough ★ for Swirled Wax (costs 20 ★)!','bad'); return; }
-            userData.chips -= 20; updateUI();
+            if(getChips() < 20){ bwLog('Not enough ★ for Swirled Wax (costs 20 ★)!','bad'); return; }
+            addChips(-20); updateUI();
         }
 
         if(type==='swirled'){
@@ -4150,7 +4171,7 @@
             if(!hadCaustic) {
                 bwLog('⚠️ Swirled Wax only works after Caustic Wax!', 'bad');
                 // Refund
-                userData.chips += 20; updateUI();
+                addChips(20); updateUI();
                 return;
             }
             // Reroll only the hive bonus stat, keep everything else
@@ -4288,7 +4309,7 @@
         if(bwState.destroyed) { bwLog('Destroyed beequip has no sell value.', 'bad'); setTimeout(()=>bwBack(), 1000); return; }
         const { reward, mode, scp, tier } = bwGetReward();
         if(reward > 0) {
-            userData.chips += reward;
+            addChips(reward);
             play('win');
             showWinOverlay(reward/bwState.beequip.cost, reward);
             addHistory("Beequip Waxing", bwState.beequip.cost, reward/bwState.beequip.cost, reward);
@@ -4357,7 +4378,7 @@
     function acCheck() {
         if(!_acEnabled || !userData) return;
         if(fpEnabled) return; // Free Play uses fake chips — skip anticheat
-        const actual = Math.floor(userData.chips);
+        const actual = Math.floor(_realUserData ? _realUserData.chips : userData.chips);
         const snap = Math.floor(_acChipsSnapshot);
         // Allow small floating point differences
         if(Math.abs(actual - snap) > 1 && !_acPendingLegit()) {
@@ -4384,7 +4405,7 @@
         document.getElementById('ac-warning').classList.add('show');
         // Reset to snapshot value and save
         if(userData) {
-            userData.chips = _acChipsSnapshot;
+            if(_realUserData) _realUserData.chips = _acChipsSnapshot; if(userData) userData.chips = _acChipsSnapshot;
             fetch(`${DB_URL}/${currentUser}.json`, { method: 'PUT', body: JSON.stringify(userData) });
         }
     }
@@ -4694,11 +4715,11 @@
         const inp = document.getElementById('kabBetInput');
         let v = Math.round((parseFloat(inp.value) || 0) * f);
         if (v < 1) v = 1;
-        if (v > userData.chips) v = userData.chips;
+        if (v > getChips()) v = getChips();
         inp.value = v;
     }
 
-    function kabMaxBet() { document.getElementById('kabBetInput').value = userData.chips; }
+    function kabMaxBet() { document.getElementById('kabBetInput').value = getChips(); }
 
     function kabWeightedRandom(weights) {
         const total = weights.reduce((s,w) => s+w.prob, 0);
@@ -4725,7 +4746,7 @@
             errEl.textContent = `Minimum bet for ${bug.label} is ${bug.minBet} ★`;
             errEl.classList.add('visible'); return;
         }
-        if (betRaw > userData.chips) {
+        if (betRaw > getChips()) {
             errEl.textContent = `Not enough chips.`;
             errEl.classList.add('visible'); return;
         }
@@ -4736,7 +4757,7 @@
 
         // Deduct bet immediately
         countGame();
-        userData.chips -= bet;
+        addChips(-bet);
         addProfit('killabug', -bet);
         updateUI();
 
@@ -4770,13 +4791,13 @@
             document.getElementById('kabResultLabel').textContent = '☠ ELIMINATED';
             document.getElementById('kabResultAmount').textContent = `-${bet.toLocaleString()}`;
             document.getElementById('kabResultMult').innerHTML = `<span>${bug.label}</span> eliminated you — full bet lost`;
-            document.getElementById('kabNewBalance').textContent = userData.chips.toLocaleString();
+            document.getElementById('kabNewBalance').textContent = getChips().toLocaleString();
 
             // Log to Discord live-games channel (same as all other games)
             addHistory("Kill a Bug", bet, 0, -bet);
 
             // History row
-            kabHistoryRows.unshift({bug, bet, totalMult: 0, reward: 0, bal: userData.chips, isWin: false, eliminated: true});
+            kabHistoryRows.unshift({bug, bet, totalMult: 0, reward: 0, bal: getChips(), isWin: false, eliminated: true});
             if (kabHistoryRows.length > 20) kabHistoryRows.pop();
             document.getElementById('kabHistoryBody').innerHTML = kabHistoryRows.map(row =>
                 `<tr><td>${row.bug.emoji}${row.eliminated ? '⚔️' : ''}</td><td style="font-family:monospace;font-size:12px">${row.bet.toLocaleString()}</td><td class="kab-col-mult">${row.totalMult.toFixed(2)}×</td><td class="${row.isWin?'kab-col-win':'kab-col-loss'}">${row.eliminated ? '☠ ELIM' : '+'+row.reward.toLocaleString()}</td><td style="font-family:monospace;font-size:12px;color:#555">${row.bal.toLocaleString()}</td></tr>`
@@ -4823,15 +4844,15 @@
         document.getElementById('kabResultLabel').textContent = isWin ? '🎉 REWARD' : '💸 REWARD';
         document.getElementById('kabResultAmount').textContent = `+${reward.toLocaleString()}`;
         document.getElementById('kabResultMult').innerHTML = `<span>${totalMult.toFixed(2)}×</span> on <span>${bet.toLocaleString()}</span> bet`;
-        userData.chips += reward;
+        addChips(reward);
         addProfit('killabug', reward);
         // Log to Discord live-games channel (same as all other games)
         addHistory("Kill a Bug", bet, totalMult, isWin ? reward : -(bet - reward));
         updateUI();
-        document.getElementById('kabNewBalance').textContent = userData.chips.toLocaleString();
+        document.getElementById('kabNewBalance').textContent = getChips().toLocaleString();
 
         // History
-        kabHistoryRows.unshift({bug, bet, totalMult, reward, bal: userData.chips, isWin, eliminated: false});
+        kabHistoryRows.unshift({bug, bet, totalMult, reward, bal: getChips(), isWin, eliminated: false});
         if (kabHistoryRows.length > 20) kabHistoryRows.pop();
         document.getElementById('kabHistoryBody').innerHTML = kabHistoryRows.map(row =>
             `<tr><td>${row.bug.emoji}${row.eliminated ? '⚔️' : ''}</td><td style="font-family:monospace;font-size:12px">${row.bet.toLocaleString()}</td><td class="kab-col-mult">${row.totalMult.toFixed(2)}×</td><td class="${row.isWin?'kab-col-win':'kab-col-loss'}">${row.eliminated ? '☠ ELIM' : '+'+row.reward.toLocaleString()}</td><td style="font-family:monospace;font-size:12px;color:#555">${row.bal.toLocaleString()}</td></tr>`
