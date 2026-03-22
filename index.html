@@ -2068,6 +2068,11 @@
             betHistory = saved ? JSON.parse(saved) : [];
         } catch(e) { betHistory = []; }
 
+        // ── Sanitize chips: guard against undefined/null/NaN from Firebase ──
+        if (typeof userData.chips !== 'number' || isNaN(userData.chips) || !isFinite(userData.chips)) {
+            userData.chips = 0;
+        }
+
         // ── Free Play Proxy: transparently route .chips reads/writes ──
         // Store the real underlying data object so we can still save it
         const _realData = userData;
@@ -2412,7 +2417,8 @@
 
     function updateUI() {
         if(!userData) return;
-        const chips = fpEnabled ? Math.floor(fpChips) : Math.floor(userData.chips);
+        const rawChips = fpEnabled ? fpChips : userData.chips;
+        const chips = (typeof rawChips === 'number' && isFinite(rawChips)) ? Math.floor(rawChips) : 0;
         const el = document.getElementById('display-chips');
         if(el && el.innerText !== String(chips)) {
             el.innerText = chips;
@@ -2444,9 +2450,15 @@
 
     // --- GAME ENGINE WRAPPERS ---
     // FP-aware balance helpers
-    function getChips() { return fpEnabled ? fpChips : userData.chips; }
+    function getChips() {
+        const v = fpEnabled ? fpChips : userData.chips;
+        return (typeof v === 'number' && isFinite(v)) ? v : 0;
+    }
     function setChips(v) { if(fpEnabled) { fpChips = v; } else { userData.chips = v; } }
-    function addChips(v) { if(fpEnabled) { fpChips += v; } else { userData.chips += v; } }
+    function addChips(v) {
+        const safe = (typeof v === 'number' && isFinite(v)) ? v : 0;
+        if (fpEnabled) { fpChips += safe; } else { userData.chips = (getChips() + safe); }
+    }
     function selectGame(g) {
         document.getElementById('selection-menu').classList.add('hidden');
         document.getElementById('game-active-page').classList.remove('hidden');
