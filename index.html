@@ -2150,6 +2150,10 @@
     }
 
     function loginSuccess() {
+        // Guard: ensure userData is never null when loginSuccess runs
+        if (!userData) {
+            userData = { chips: 0, displayName: 'User', avatarUrl: '', discord: true };
+        }
         // Load saved bet history for this user
         try {
             const saved = localStorage.getItem('swarm_history_' + currentUser);
