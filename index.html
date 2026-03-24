@@ -2177,8 +2177,9 @@
         document.getElementById('auth-screen').classList.add('hidden');
         document.getElementById('main-app').classList.remove('hidden');
         document.getElementById('display-name').innerText = currentUser;
-        const admins = ["discord_595767263374737409", "discord_863482425417662475"];
-        if(admins.includes(currentUser) || admins.includes('discord_' + currentUser)) document.getElementById('link-admin').classList.remove('hidden');
+        const adminIds = ["595767263374737409", "863482425417662475"];
+        const cleanUser = String(currentUser).replace("discord_", "");
+        if(adminIds.includes(cleanUser)) document.getElementById('link-admin').classList.remove('hidden');
         buildRoulette(); updateUI();
         document.getElementById('pf-float-btn').classList.remove('hidden');
         // Show home page on login
