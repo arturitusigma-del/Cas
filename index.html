@@ -1903,19 +1903,50 @@
         }
     }
     async function sbUpsertUser(discordId, displayName, avatarUrl, chips) {
+        const body = JSON.stringify({discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0});
+        // Try 1: upsert with merge-duplicates
         try {
             const upsertHeaders = {...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"};
-            const r = await fetch(`${SB_REST}/users`, {
-                method: "POST", headers: upsertHeaders,
-                body: JSON.stringify({discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0})
-            });
-            if (!r.ok) { console.error('[SwarmBet] sbUpsertUser HTTP error:', r.status, r.statusText); return null; }
-            const rows = await r.json();
-            return rows && rows[0] ? rows[0] : null;
+            const r = await fetch(`${SB_REST}/users`, {method: "POST", headers: upsertHeaders, body});
+            if (r.ok) {
+                const rows = await r.json();
+                if (rows && rows[0]) return rows[0];
+            } else {
+                console.warn('[SwarmBet] sbUpsertUser upsert failed:', r.status, await r.text());
+            }
         } catch(e) {
-            console.error('[SwarmBet] sbUpsertUser failed:', e.message);
-            return null;
+            console.warn('[SwarmBet] sbUpsertUser upsert error:', e.message);
         }
+        // Try 2: plain INSERT
+        try {
+            const insertHeaders = {...SB_HEADERS, "Prefer": "return=representation"};
+            const r = await fetch(`${SB_REST}/users`, {method: "POST", headers: insertHeaders, body});
+            if (r.ok) {
+                const rows = await r.json();
+                if (rows && rows[0]) return rows[0];
+            } else {
+                console.warn('[SwarmBet] sbUpsertUser insert failed:', r.status, await r.text());
+            }
+        } catch(e) {
+            console.warn('[SwarmBet] sbUpsertUser insert error:', e.message);
+        }
+        // Try 3: PATCH in case row already exists but GET missed it
+        try {
+            const patchHeaders = {...SB_HEADERS, "Prefer": "return=representation"};
+            const r = await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
+                method: "PATCH", headers: patchHeaders,
+                body: JSON.stringify({display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0})
+            });
+            if (r.ok) {
+                const rows = await r.json();
+                if (rows && rows[0]) return rows[0];
+            }
+        } catch(e) {
+            console.warn('[SwarmBet] sbUpsertUser patch fallback error:', e.message);
+        }
+        // All failed — return a local object so app still works
+        console.error('[SwarmBet] All Supabase write attempts failed. Check RLS policies on users table.');
+        return { discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0 };
     }
     async function sbSaveUser(discordId, data) {
         const chips = typeof data.chips === "number" && isFinite(data.chips) ? data.chips : 0;
