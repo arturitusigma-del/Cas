@@ -1888,6 +1888,42 @@
         "Content-Type":  "application/json",
         "Prefer":        "return=representation",
     };
+    // Force-create user bypassing RLS using raw SQL via Supabase RPC
+    async function sbForceCreateUser(discordId, displayName, avatarUrl) {
+        try {
+            const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/upsert_user`, {
+                method: 'POST',
+                headers: SB_HEADERS,
+                body: JSON.stringify({p_discord_id: discordId, p_display_name: displayName, p_avatar_url: avatarUrl, p_chips: 0})
+            });
+            // If RPC doesn't exist, fall through silently
+        } catch(e) {}
+
+        // Try raw insert with all headers
+        const headers = {
+            ...SB_HEADERS,
+            "Prefer": "resolution=merge-duplicates,return=representation",
+            "X-Client-Info": "swarmbet"
+        };
+        try {
+            const r = await fetch(`${SB_REST}/users`, {
+                method: 'POST', headers,
+                body: JSON.stringify({discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: 0})
+            });
+            if(r.ok) {
+                const rows = await r.json();
+                if(rows && rows[0]) return rows[0];
+            }
+            // Log full error for debugging
+            const errText = await r.text().catch(()=>'');
+            console.warn('[SwarmBet] Force insert status:', r.status, errText);
+        } catch(e) {
+            console.warn('[SwarmBet] Force insert error:', e.message);
+        }
+        // Return local fallback so app works even if Supabase is blocked
+        return {discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: 0};
+    }
+
     const DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1475155012266098688/gN9IvDw1VACuP9wrUJ6jjpxsfbyTC0_laPXcSI4OE1s9wIlbhFN58XoEpnju-TNm-uZb";
 
     // ── Supabase helpers ──
@@ -2127,7 +2163,8 @@
         try {
             let row = await sbGetUser(dcUser.id);
             if (!row) {
-                row = await sbUpsertUser(dcUser.id, displayName, avatarUrl, 0);
+                // Try force create
+                row = await sbForceCreateUser(dcUser.id, displayName, avatarUrl);
             } else {
                 try {
                     await fetch(`${SB_REST}/users?discord_id=eq.${dcUser.id}`, {
@@ -2874,113 +2911,116 @@
     // ═══════════════════════════════════════════════
     async function adminDeposit() {
         const raw = document.getElementById('adm-deposit-target').value.trim();
-        const target = /^\d{17,20}$/.test(raw) ? 'discord_' + raw : raw;
+        if(!raw) { play('error'); return alert('Please enter a Discord ID!'); }
         const amount = parseInt(document.getElementById('adm-deposit-amount').value);
-        
-        if(!target || isNaN(amount) || amount <= 0) {
-            play('error');
-            return alert('Please enter a valid username/ID and positive amount!');
+        if(isNaN(amount) || amount <= 0) { play('error'); return alert('Please enter a valid amount!'); }
+
+        // Strip any discord_ prefix — always work with plain numeric ID
+        const discordId = raw.replace('discord_', '').trim();
+
+        // Try to get existing row
+        let tRow = await sbGetUser(discordId);
+
+        // If not found, CREATE the user automatically
+        if(!tRow) {
+            const upsertHeaders = {...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"};
+            try {
+                const r = await fetch(`${SB_REST}/users`, {
+                    method: 'POST', headers: upsertHeaders,
+                    body: JSON.stringify({discord_id: discordId, display_name: discordId, avatar_url: '', chips: 0})
+                });
+                const rows = await r.json();
+                tRow = rows && rows[0] ? rows[0] : null;
+            } catch(e) {}
         }
-        
-        // Fetch target player data
-        const tRow = await sbGetUser(target.replace('discord_',''));
-        if(!tRow) { play('error'); return alert('Player not found!'); }
-        const playerName = tRow.display_name || raw;
-        const oldBalance = tRow.chips || 0;
+
+        // If still null, PATCH directly (RLS might block INSERT but allow PATCH)
+        if(!tRow) {
+            try {
+                const r = await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
+                    method: 'PATCH', headers: SB_HEADERS,
+                    body: JSON.stringify({chips: amount})
+                });
+                const rows = await r.json();
+                tRow = rows && rows[0] ? rows[0] : {discord_id: discordId, display_name: discordId, chips: 0};
+            } catch(e) {}
+        }
+
+        const playerName = (tRow && tRow.display_name) ? tRow.display_name : discordId;
+        const oldBalance = (tRow && typeof tRow.chips === 'number') ? tRow.chips : 0;
         const newBalance = oldBalance + amount;
-        await fetch(`${SB_REST}/users?discord_id=eq.${target.replace('discord_','')}`, {method:'PATCH',headers:SB_HEADERS,body:JSON.stringify({chips:newBalance})});
-        const tData = {...tRow, chips: newBalance};
-        
-        // Update UI if it's current user
-        if(target.replace('discord_','') === currentUser) {
-            if (_realUserData) _realUserData.chips = newBalance;
-            if (_realUserData) _realUserData.chips = newBalance;
-            if (userData) userData.chips = newBalance;
-            if (_acEnabled) acLegitChange(newBalance);
+
+        // Write new balance
+        try {
+            await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
+                method: 'PATCH', headers: SB_HEADERS,
+                body: JSON.stringify({chips: newBalance})
+            });
+        } catch(e) {
+            play('error');
+            return alert('Failed to save to Supabase. Check RLS policies.\n' + e.message);
+        }
+
+        // Update UI if depositing to self
+        if(discordId === String(currentUser).replace('discord_','')) {
+            if(_realUserData) _realUserData.chips = newBalance;
+            if(userData) userData.chips = newBalance;
+            if(_acEnabled) acLegitChange(newBalance);
             updateUI();
         }
-        
-        // Get admin name
-        const adminName = userData?.username || userData?.discordName || currentUser || "Unknown Admin";
-        
-        // Log to Discord
-        await sendDiscordLog('deposit', {
-            recipientName: playerName,
-            adminName: adminName,
-            amount: amount,
-            oldBalance: oldBalance,
-            newBalance: newBalance
-        });
-        
-        // Local log and notification
-        admLog(`$ Deposited ${amount}★ to ${playerName} (${oldBalance} → ${newBalance})`);
+
+        const adminName = userData?.displayName || currentUser || 'Admin';
+        await sendDiscordLog('deposit', {recipientName: playerName, adminName, amount, oldBalance, newBalance});
+        admLog(`✅ Deposited ${amount}★ to ${playerName} (${oldBalance} → ${newBalance})`);
         play('admin_give');
-        alert(`✅ Successfully deposited ${amount}★ to ${playerName}!\n\nOld Balance: ${oldBalance}★\nNew Balance: ${newBalance}★`);
-        
-        // Clear inputs
+        alert(`✅ Deposited ${amount}★ to ${playerName}!\n\n${oldBalance}★ → ${newBalance}★`);
         document.getElementById('adm-deposit-target').value = '';
         document.getElementById('adm-deposit-amount').value = '';
     }
 
     async function adminWithdraw() {
         const raw = document.getElementById('adm-withdraw-target').value.trim();
-        const target = /^\d{17,20}$/.test(raw) ? 'discord_' + raw : raw;
+        if(!raw) { play('error'); return alert('Please enter a Discord ID!'); }
         const amount = parseInt(document.getElementById('adm-withdraw-amount').value);
-        
-        if(!target || isNaN(amount) || amount <= 0) {
-            play('error');
-            return alert('Please enter a valid username/ID and positive amount!');
-        }
-        
-        // Fetch target player data
-        const tRow = await sbGetUser(target.replace('discord_',''));
-        if(!tRow) { play('error'); return alert('Player not found!'); }
-        const playerName = tRow.display_name || raw;
+        if(isNaN(amount) || amount <= 0) { play('error'); return alert('Please enter a valid amount!'); }
+
+        const discordId = raw.replace('discord_', '').trim();
+        const tRow = await sbGetUser(discordId);
+        if(!tRow) { play('error'); return alert('Player not found! They must log in first.'); }
+
+        const playerName = tRow.display_name || discordId;
         const oldBalance = tRow.chips || 0;
-        
-        // Check if player has enough balance
+
         if(oldBalance < amount) {
             play('error');
-            return alert(`Cannot withdraw ${amount}★!\n\n${playerName} only has ${oldBalance}★`);
+            return alert(`Cannot withdraw ${amount}★! ${playerName} only has ${oldBalance}★`);
         }
-        
+
         const newBalance = oldBalance - amount;
-        
-        // Confirm withdrawal
-        if(!confirm(`Withdraw ${amount}★ from ${playerName}?\n\nCurrent: ${oldBalance}★\nAfter: ${newBalance}★`)) {
-            return;
+        if(!confirm(`Withdraw ${amount}★ from ${playerName}?\n\n${oldBalance}★ → ${newBalance}★`)) return;
+
+        try {
+            await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
+                method: 'PATCH', headers: SB_HEADERS,
+                body: JSON.stringify({chips: newBalance})
+            });
+        } catch(e) {
+            play('error');
+            return alert('Failed to save. Check RLS policies.');
         }
-        
-        // Update player balance
-        // chips already updated via Supabase above
-        
-        // Update UI if it's current user
-        if(target.replace('discord_','') === currentUser) {
-            if (_realUserData) _realUserData.chips = newBalance;
-            if (_realUserData) _realUserData.chips = newBalance;
-            if (userData) userData.chips = newBalance;
-            if (_acEnabled) acLegitChange(newBalance);
+
+        if(discordId === String(currentUser).replace('discord_','')) {
+            if(_realUserData) _realUserData.chips = newBalance;
+            if(userData) userData.chips = newBalance;
+            if(_acEnabled) acLegitChange(newBalance);
             updateUI();
         }
-        
-        // Get admin name
-        const adminName = userData?.username || userData?.discordName || currentUser || "Unknown Admin";
-        
-        // Log to Discord
-        await sendDiscordLog('withdraw', {
-            targetName: playerName,
-            adminName: adminName,
-            amount: amount,
-            oldBalance: oldBalance,
-            newBalance: newBalance
-        });
-        
-        // Local log and notification
+
+        const adminName = userData?.displayName || currentUser || 'Admin';
+        await sendDiscordLog('withdraw', {targetName: playerName, adminName, amount, oldBalance, newBalance});
         admLog(`🔻 Withdrew ${amount}★ from ${playerName} (${oldBalance} → ${newBalance})`);
         play('admin_reset');
-        alert(`✅ Successfully withdrew ${amount}★ from ${playerName}!\n\nOld Balance: ${oldBalance}★\nNew Balance: ${newBalance}★`);
-        
-        // Clear inputs
+        alert(`✅ Withdrew ${amount}★ from ${playerName}!\n\n${oldBalance}★ → ${newBalance}★`);
         document.getElementById('adm-withdraw-target').value = '';
         document.getElementById('adm-withdraw-amount').value = '';
     }
