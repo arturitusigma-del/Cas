@@ -4667,17 +4667,26 @@
             if(handled) return;
         }
         if(currentUser) {
-            const row = await sbGetUser(currentUser);
-            if(row) {
-                const chips = (typeof row.chips === 'number' && isFinite(row.chips)) ? row.chips : 0;
-                userData = { chips, displayName: row.display_name, avatarUrl: row.avatar_url, discord: true };
-                loginSuccess();
-                if(userData.displayName && userData.avatarUrl) {
-                    injectDiscordAvatar(userData.displayName, userData.avatarUrl);
+            try {
+                const row = await sbGetUser(currentUser);
+                if(row) {
+                    const chips = (typeof row.chips === 'number' && isFinite(row.chips)) ? row.chips : 0;
+                    const displayName = row.display_name || 'User';
+                    const avatarUrl = row.avatar_url || '';
+                    userData = { chips, displayName, avatarUrl, discord: true };
+                    loginSuccess();
+                    if(displayName && avatarUrl) {
+                        injectDiscordAvatar(displayName, avatarUrl);
+                    }
+                } else {
+                    console.warn('[SwarmBet] Supabase returned null on auto-login. Clearing saved session.');
+                    localStorage.removeItem('swarm_user');
+                    currentUser = null;
                 }
-            } else {
-                // Supabase returned nothing — likely RLS is on or table missing
-                console.warn('[SwarmBet] Could not load user from Supabase. Check RLS settings.');
+            } catch(autoErr) {
+                console.error('[SwarmBet] Auto-login error:', autoErr.message);
+                localStorage.removeItem('swarm_user');
+                currentUser = null;
             }
         }
     };
