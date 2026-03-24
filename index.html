@@ -2074,48 +2074,53 @@
         localStorage.removeItem('swarm_oauth_state');
         const statusEl = document.getElementById('discord-status');
         if(statusEl) statusEl.textContent = '⏳ Fetching Discord profile...';
+        // Step 1: fetch Discord profile
+        let dcUser = null;
         try {
             const userRes = await fetch('https://discord.com/api/users/@me', { headers: { 'Authorization': 'Bearer ' + accessToken } });
-            if(!userRes.ok) throw new Error('Discord API ' + userRes.status);
-            const dcUser = await userRes.json();
-            const discordUsername = 'discord_' + dcUser.id;
-            const displayName = dcUser.username + (dcUser.discriminator && dcUser.discriminator !== '0' ? '#' + dcUser.discriminator : '');
-            const avatarUrl = dcUser.avatar ? `https://cdn.discordapp.com/avatars/${dcUser.id}/${dcUser.avatar}.png` : `https://cdn.discordapp.com/embed/avatars/${parseInt(dcUser.id) % 6}.png`;
-            // Fetch or create user in Supabase
+            if(!userRes.ok) throw new Error('Discord API returned ' + userRes.status);
+            dcUser = await userRes.json();
+        } catch(e) {
+            console.error('[SwarmBet] Discord profile fetch failed:', e.message);
+            if(statusEl) statusEl.textContent = '❌ Could not reach Discord. Try again.';
+            return false;
+        }
+
+        const displayName = dcUser.username + (dcUser.discriminator && dcUser.discriminator !== '0' ? '#' + dcUser.discriminator : '');
+        const avatarUrl = dcUser.avatar
+            ? `https://cdn.discordapp.com/avatars/${dcUser.id}/${dcUser.avatar}.png`
+            : `https://cdn.discordapp.com/embed/avatars/${parseInt(dcUser.id) % 6}.png`;
+
+        // Step 2: load or create Supabase row — NEVER crash if Supabase is down
+        let chips = 0;
+        try {
             let row = await sbGetUser(dcUser.id);
-            if(!row) {
+            if (!row) {
                 row = await sbUpsertUser(dcUser.id, displayName, avatarUrl, 0);
             } else {
-                // Update display name + avatar on every login
                 try {
                     await fetch(`${SB_REST}/users?discord_id=eq.${dcUser.id}`, {
-                        method: "PATCH", headers: SB_HEADERS,
-                        body: JSON.stringify({display_name: displayName, avatar_url: avatarUrl})
+                        method: 'PATCH', headers: SB_HEADERS,
+                        body: JSON.stringify({ display_name: displayName, avatar_url: avatarUrl })
                     });
-                } catch(patchErr) {
-                    console.warn('[SwarmBet] Avatar/name patch failed:', patchErr.message);
-                }
+                } catch(_) {}
                 row.display_name = displayName;
                 row.avatar_url   = avatarUrl;
             }
-            // If Supabase failed entirely, use a guest fallback so the app still loads
-            if(!row) {
-                console.warn('[SwarmBet] Supabase returned null — using guest fallback. Check RLS policies & table schema.');
-                row = { chips: 0, display_name: displayName, avatar_url: avatarUrl };
+            if (row && typeof row.chips === 'number' && isFinite(row.chips)) {
+                chips = row.chips;
             }
-            // Normalise row to the shape the rest of the app expects
-            const user = { chips: row.chips ?? 0, displayName: row.display_name || displayName, avatarUrl: row.avatar_url || avatarUrl, discord: true };
-            currentUser = dcUser.id;  // store plain Discord ID (no discord_ prefix)
-            userData = user;
-            localStorage.setItem('swarm_user', dcUser.id);
-            loginSuccess();
-            injectDiscordAvatar(displayName, avatarUrl);
-            return true;
         } catch(e) {
-            console.error('Discord OAuth error:', e);
-            if(statusEl) statusEl.textContent = '❌ Error: ' + e.message;
-            return false;
+            console.warn('[SwarmBet] Supabase unavailable, using chips=0 fallback:', e.message);
         }
+
+        // Step 3: set global state and enter the app
+        currentUser = dcUser.id;
+        userData = { chips: chips, displayName: displayName, avatarUrl: avatarUrl, discord: true };
+        localStorage.setItem('swarm_user', dcUser.id);
+        loginSuccess();
+        injectDiscordAvatar(displayName, avatarUrl);
+        return true;
     }
 
     function injectDiscordAvatar(displayName, avatarUrl) {
