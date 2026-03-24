@@ -1878,121 +1878,61 @@
 <div id="win-container"></div>
 
 <script>
-    // ── Supabase config ──
-    const SUPABASE_URL  = "https://slcvdcfjarjugibnjkdh.supabase.co";
-    const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNsY3ZkY2ZqYXJqdWdpYmpua2RoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyMDI1NzEsImV4cCI6MjA4OTc3ODU3MX0.DY3NN9swWDFv_OgnHY-shLRajhrtRTKGmBIV-rMsKwY";
-    const SB_REST       = SUPABASE_URL + "/rest/v1";
-    const SB_HEADERS    = {
-        "apikey":        SUPABASE_ANON,
-        "Authorization": "Bearer " + SUPABASE_ANON,
-        "Content-Type":  "application/json",
-        "Prefer":        "return=representation",
-    };
-    // Force-create user bypassing RLS using raw SQL via Supabase RPC
-    async function sbForceCreateUser(discordId, displayName, avatarUrl) {
-        try {
-            const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/upsert_user`, {
-                method: 'POST',
-                headers: SB_HEADERS,
-                body: JSON.stringify({p_discord_id: discordId, p_display_name: displayName, p_avatar_url: avatarUrl, p_chips: 0})
-            });
-            // If RPC doesn't exist, fall through silently
-        } catch(e) {}
+    // ── Firebase config ──
+    const FIREBASE_URL    = "https://casbss-c75a0-default-rtdb.europe-west1.firebasedatabase.app";
+    const FIREBASE_SECRET = "xhfB9N48NoSpd4CY3eBW01HUPZU86MYDwJD5ef7U";
 
-        // Try raw insert with all headers
-        const headers = {
-            ...SB_HEADERS,
-            "Prefer": "resolution=merge-duplicates,return=representation",
-            "X-Client-Info": "swarmbet"
-        };
-        try {
-            const r = await fetch(`${SB_REST}/users`, {
-                method: 'POST', headers,
-                body: JSON.stringify({discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: 0})
-            });
-            if(r.ok) {
-                const rows = await r.json();
-                if(rows && rows[0]) return rows[0];
-            }
-            // Log full error for debugging
-            const errText = await r.text().catch(()=>'');
-            console.warn('[SwarmBet] Force insert status:', r.status, errText);
-        } catch(e) {
-            console.warn('[SwarmBet] Force insert error:', e.message);
-        }
-        // Return local fallback so app works even if Supabase is blocked
-        return {discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: 0};
+    function fbUrl(path) {
+        return `${FIREBASE_URL}/${path}.json?auth=${FIREBASE_SECRET}`;
     }
 
     const DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1475155012266098688/gN9IvDw1VACuP9wrUJ6jjpxsfbyTC0_laPXcSI4OE1s9wIlbhFN58XoEpnju-TNm-uZb";
 
-    // ── Supabase helpers ──
+    // ── Firebase helpers (same interface as old Supabase helpers) ──
     async function sbGetUser(discordId) {
         try {
-            const r = await fetch(`${SB_REST}/users?discord_id=eq.${discordId}&select=*`, {headers: SB_HEADERS});
-            if (!r.ok) { console.error('[SwarmBet] sbGetUser HTTP error:', r.status, r.statusText); return null; }
-            const rows = await r.json();
-            return rows && rows[0] ? rows[0] : null;
+            const r = await fetch(fbUrl(`users/${discordId}`));
+            if (!r.ok) { console.error('[SwarmBet] fbGetUser HTTP error:', r.status); return null; }
+            const data = await r.json();
+            return data || null;
         } catch(e) {
-            console.error('[SwarmBet] sbGetUser failed:', e.message);
+            console.error('[SwarmBet] fbGetUser failed:', e.message);
             return null;
         }
     }
+    async function sbForceCreateUser(discordId, displayName, avatarUrl) {
+        return await sbUpsertUser(discordId, displayName, avatarUrl, 0);
+    }
     async function sbUpsertUser(discordId, displayName, avatarUrl, chips) {
-        const body = JSON.stringify({discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0});
-        // Try 1: upsert with merge-duplicates
         try {
-            const upsertHeaders = {...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"};
-            const r = await fetch(`${SB_REST}/users`, {method: "POST", headers: upsertHeaders, body});
-            if (r.ok) {
-                const rows = await r.json();
-                if (rows && rows[0]) return rows[0];
-            } else {
-                console.warn('[SwarmBet] sbUpsertUser upsert failed:', r.status, await r.text());
-            }
-        } catch(e) {
-            console.warn('[SwarmBet] sbUpsertUser upsert error:', e.message);
-        }
-        // Try 2: plain INSERT
-        try {
-            const insertHeaders = {...SB_HEADERS, "Prefer": "return=representation"};
-            const r = await fetch(`${SB_REST}/users`, {method: "POST", headers: insertHeaders, body});
-            if (r.ok) {
-                const rows = await r.json();
-                if (rows && rows[0]) return rows[0];
-            } else {
-                console.warn('[SwarmBet] sbUpsertUser insert failed:', r.status, await r.text());
-            }
-        } catch(e) {
-            console.warn('[SwarmBet] sbUpsertUser insert error:', e.message);
-        }
-        // Try 3: PATCH in case row already exists but GET missed it
-        try {
-            const patchHeaders = {...SB_HEADERS, "Prefer": "return=representation"};
-            const r = await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
-                method: "PATCH", headers: patchHeaders,
-                body: JSON.stringify({display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0})
+            const existing = await sbGetUser(discordId);
+            const safeChips = (existing && typeof existing.chips === 'number') ? existing.chips : (chips ?? 0);
+            const payload = {
+                discord_id: discordId,
+                display_name: displayName,
+                avatar_url: avatarUrl,
+                chips: safeChips,
+                updated_at: new Date().toISOString()
+            };
+            const r = await fetch(fbUrl(`users/${discordId}`), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
             });
-            if (r.ok) {
-                const rows = await r.json();
-                if (rows && rows[0]) return rows[0];
-            }
+            if (r.ok) return payload;
         } catch(e) {
-            console.warn('[SwarmBet] sbUpsertUser patch fallback error:', e.message);
+            console.warn('[SwarmBet] fbUpsertUser error:', e.message);
         }
-        // All failed — return a local object so app still works
-        console.error('[SwarmBet] All Supabase write attempts failed. Check RLS policies on users table.');
         return { discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0 };
     }
     async function sbSaveUser(discordId, data) {
         const chips = typeof data.chips === "number" && isFinite(data.chips) ? data.chips : 0;
-        // Fetch current Supabase value first — never overwrite with a LOWER balance
-        // (prevents bot deposits being wiped out by a stale in-memory save)
         try {
             const fresh = await sbGetUser(discordId);
             const safeChips = fresh && typeof fresh.chips === 'number' ? Math.max(chips, fresh.chips) : chips;
-            await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
-                method: "PATCH", headers: SB_HEADERS,
+            await fetch(fbUrl(`users/${discordId}`), {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     chips: safeChips,
                     display_name: data.displayName || data.display_name,
@@ -2000,31 +1940,51 @@
                     updated_at: new Date().toISOString()
                 })
             });
-            // Keep in-memory in sync too
-            if(safeChips !== chips && _realUserData) {
+            if (safeChips !== chips && _realUserData) {
                 _realUserData.chips = safeChips;
                 if(userData) userData.chips = safeChips;
             }
         } catch(e) {
-            console.warn('[SwarmBet] sbSaveUser error:', e);
+            console.warn('[SwarmBet] fbSaveUser error:', e);
         }
     }
     async function sbGetPromo(code) {
-        const r = await fetch(`${SB_REST}/promos?code=eq.${encodeURIComponent(code)}&select=*`, {headers: SB_HEADERS});
-        const rows = await r.json();
-        return rows && rows[0] ? rows[0] : null;
+        try {
+            const key = code.replace(/[.#$/\[\]]/g, '_');
+            const r = await fetch(fbUrl(`promos/${key}`));
+            if (!r.ok) return null;
+            const data = await r.json();
+            return data ? { code, val: data.val } : null;
+        } catch(e) { return null; }
     }
     async function sbCreatePromo(code, val) {
-        const upsertHeaders = {...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"};
-        await fetch(`${SB_REST}/promos`, {method:"POST", headers: upsertHeaders, body: JSON.stringify({code, val})});
+        try {
+            const key = code.replace(/[.#$/\[\]]/g, '_');
+            await fetch(fbUrl(`promos/${key}`), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code, val })
+            });
+        } catch(e) {}
     }
     async function sbCheckPromoUsed(code, discordId) {
-        const r = await fetch(`${SB_REST}/promo_used?code=eq.${encodeURIComponent(code)}&discord_id=eq.${discordId}&select=id`, {headers: SB_HEADERS});
-        const rows = await r.json();
-        return rows && rows.length > 0;
+        try {
+            const key = (code + '_' + discordId).replace(/[.#$/\[\]]/g, '_');
+            const r = await fetch(fbUrl(`promo_used/${key}`));
+            if (!r.ok) return false;
+            const data = await r.json();
+            return data !== null;
+        } catch(e) { return false; }
     }
     async function sbMarkPromoUsed(code, discordId) {
-        await fetch(`${SB_REST}/promo_used`, {method:"POST", headers: SB_HEADERS, body: JSON.stringify({code, discord_id: discordId})});
+        try {
+            const key = (code + '_' + discordId).replace(/[.#$/\[\]]/g, '_');
+            await fetch(fbUrl(`promo_used/${key}`), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code, discord_id: discordId, used_at: new Date().toISOString() })
+            });
+        } catch(e) {}
     }
     
     let currentUser = localStorage.getItem('swarm_user');
@@ -2167,8 +2127,9 @@
                 row = await sbForceCreateUser(dcUser.id, displayName, avatarUrl);
             } else {
                 try {
-                    await fetch(`${SB_REST}/users?discord_id=eq.${dcUser.id}`, {
-                        method: 'PATCH', headers: SB_HEADERS,
+                    await fetch(fbUrl(`users/${dcUser.id}`), {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ display_name: displayName, avatar_url: avatarUrl })
                     });
                 } catch(_) {}
@@ -2179,7 +2140,7 @@
                 chips = row.chips;
             }
         } catch(e) {
-            console.warn('[SwarmBet] Supabase unavailable, using chips=0 fallback:', e.message);
+            console.warn('[SwarmBet] Firebase unavailable, using chips=0 fallback:', e.message);
         }
 
         // Step 3: set global state and enter the app
@@ -2861,7 +2822,7 @@
         if(!tRow) { play('error'); return alert('Player not found!'); }
         const oldChips = tRow.chips || 0;
         const newChips = oldChips + amount;
-        await fetch(`${SB_REST}/users?discord_id=eq.${target.replace('discord_','')}`, {method:'PATCH',headers:SB_HEADERS,body:JSON.stringify({chips:newChips})});
+        await fetch(fbUrl(`users/${target.replace('discord_','')}`), {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({chips:newChips})});
         const tData = {...tRow, chips: newChips};
         if(target.replace('discord_','') === currentUser) { if(_realUserData) _realUserData.chips = tData.chips; if(userData) userData.chips = tData.chips; if(_acEnabled) acLegitChange(tData.chips); updateUI(); }
         
@@ -2887,7 +2848,7 @@
         const tRow = await sbGetUser(target.replace('discord_',''));
         if(!tRow) { play('error'); return alert('Player not found!'); }
         const oldBal = tRow.chips || 0;
-        await fetch(`${SB_REST}/users?discord_id=eq.${target.replace('discord_','')}`, {method:'PATCH',headers:SB_HEADERS,body:JSON.stringify({chips:newBal})});
+        await fetch(fbUrl(`users/${target.replace('discord_','')}`), {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({chips:newBal})});
         const tData = {...tRow, chips: newBal};
         if(target.replace('discord_','') === currentUser) { if(_realUserData) _realUserData.chips = newBal; if(userData) userData.chips = newBal; if(_acEnabled) acLegitChange(newBal); updateUI(); }
         
@@ -2923,26 +2884,10 @@
 
         // If not found, CREATE the user automatically
         if(!tRow) {
-            const upsertHeaders = {...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"};
             try {
-                const r = await fetch(`${SB_REST}/users`, {
-                    method: 'POST', headers: upsertHeaders,
-                    body: JSON.stringify({discord_id: discordId, display_name: discordId, avatar_url: '', chips: 0})
-                });
-                const rows = await r.json();
-                tRow = rows && rows[0] ? rows[0] : null;
-            } catch(e) {}
-        }
-
-        // If still null, PATCH directly (RLS might block INSERT but allow PATCH)
-        if(!tRow) {
-            try {
-                const r = await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
-                    method: 'PATCH', headers: SB_HEADERS,
-                    body: JSON.stringify({chips: amount})
-                });
-                const rows = await r.json();
-                tRow = rows && rows[0] ? rows[0] : {discord_id: discordId, display_name: discordId, chips: 0};
+                const payload = {discord_id: discordId, display_name: discordId, avatar_url: '', chips: 0, updated_at: new Date().toISOString()};
+                const r = await fetch(fbUrl(`users/${discordId}`), {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+                if(r.ok) tRow = payload;
             } catch(e) {}
         }
 
@@ -2952,13 +2897,13 @@
 
         // Write new balance
         try {
-            await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
-                method: 'PATCH', headers: SB_HEADERS,
-                body: JSON.stringify({chips: newBalance})
+            await fetch(fbUrl(`users/${discordId}`), {
+                method: 'PATCH', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({chips: newBalance, updated_at: new Date().toISOString()})
             });
         } catch(e) {
             play('error');
-            return alert('Failed to save to Supabase. Check RLS policies.\n' + e.message);
+            return alert('Failed to save to Firebase.\n' + e.message);
         }
 
         // Update UI if depositing to self
@@ -3000,13 +2945,13 @@
         if(!confirm(`Withdraw ${amount}★ from ${playerName}?\n\n${oldBalance}★ → ${newBalance}★`)) return;
 
         try {
-            await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
-                method: 'PATCH', headers: SB_HEADERS,
-                body: JSON.stringify({chips: newBalance})
+            await fetch(fbUrl(`users/${discordId}`), {
+                method: 'PATCH', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({chips: newBalance, updated_at: new Date().toISOString()})
             });
         } catch(e) {
             play('error');
-            return alert('Failed to save. Check RLS policies.');
+            return alert('Failed to save to Firebase.');
         }
 
         if(discordId === String(currentUser).replace('discord_','')) {
