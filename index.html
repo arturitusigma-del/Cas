@@ -1928,22 +1928,16 @@
     async function sbSaveUser(discordId, data) {
         const chips = typeof data.chips === "number" && isFinite(data.chips) ? data.chips : 0;
         try {
-            const fresh = await sbGetUser(discordId);
-            const safeChips = fresh && typeof fresh.chips === 'number' ? Math.max(chips, fresh.chips) : chips;
             await fetch(fbUrl(`users/${discordId}`), {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    chips: safeChips,
+                    chips: chips,
                     display_name: data.displayName || data.display_name,
                     avatar_url: data.avatarUrl || data.avatar_url,
                     updated_at: new Date().toISOString()
                 })
             });
-            if (safeChips !== chips && _realUserData) {
-                _realUserData.chips = safeChips;
-                if(userData) userData.chips = safeChips;
-            }
         } catch(e) {
             console.warn('[SwarmBet] fbSaveUser error:', e);
         }
