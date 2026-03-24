@@ -1894,14 +1894,11 @@
     async function sbGetUser(discordId) {
         try {
             const r = await fetch(`${SB_REST}/users?discord_id=eq.${discordId}&select=*`, {headers: SB_HEADERS});
-            if (!r.ok) {
-                console.error('[SwarmBet] sbGetUser HTTP error:', r.status, r.statusText);
-                return null;
-            }
+            if (!r.ok) { console.error('[SwarmBet] sbGetUser HTTP error:', r.status, r.statusText); return null; }
             const rows = await r.json();
             return rows && rows[0] ? rows[0] : null;
         } catch(e) {
-            console.error('[SwarmBet] sbGetUser failed (network/CORS?):', e.message);
+            console.error('[SwarmBet] sbGetUser failed:', e.message);
             return null;
         }
     }
@@ -1912,14 +1909,11 @@
                 method: "POST", headers: upsertHeaders,
                 body: JSON.stringify({discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0})
             });
-            if (!r.ok) {
-                console.error('[SwarmBet] sbUpsertUser HTTP error:', r.status, r.statusText);
-                return null;
-            }
+            if (!r.ok) { console.error('[SwarmBet] sbUpsertUser HTTP error:', r.status, r.statusText); return null; }
             const rows = await r.json();
             return rows && rows[0] ? rows[0] : null;
         } catch(e) {
-            console.error('[SwarmBet] sbUpsertUser failed (network/CORS?):', e.message);
+            console.error('[SwarmBet] sbUpsertUser failed:', e.message);
             return null;
         }
     }
@@ -2093,12 +2087,21 @@
                 row = await sbUpsertUser(dcUser.id, displayName, avatarUrl, 0);
             } else {
                 // Update display name + avatar on every login
-                await fetch(`${SB_REST}/users?discord_id=eq.${dcUser.id}`, {
-                    method: "PATCH", headers: SB_HEADERS,
-                    body: JSON.stringify({display_name: displayName, avatar_url: avatarUrl})
-                });
+                try {
+                    await fetch(`${SB_REST}/users?discord_id=eq.${dcUser.id}`, {
+                        method: "PATCH", headers: SB_HEADERS,
+                        body: JSON.stringify({display_name: displayName, avatar_url: avatarUrl})
+                    });
+                } catch(patchErr) {
+                    console.warn('[SwarmBet] Avatar/name patch failed:', patchErr.message);
+                }
                 row.display_name = displayName;
                 row.avatar_url   = avatarUrl;
+            }
+            // If Supabase failed entirely, use a guest fallback so the app still loads
+            if(!row) {
+                console.warn('[SwarmBet] Supabase returned null — using guest fallback. Check RLS policies & table schema.');
+                row = { chips: 0, display_name: displayName, avatar_url: avatarUrl };
             }
             // Normalise row to the shape the rest of the app expects
             const user = { chips: row.chips ?? 0, displayName: row.display_name || displayName, avatarUrl: row.avatar_url || avatarUrl, discord: true };
@@ -2110,10 +2113,7 @@
             return true;
         } catch(e) {
             console.error('Discord OAuth error:', e);
-            const msg = e.message.includes('fetch') 
-                ? '❌ Network error — check Supabase RLS or table setup. See console for details.'
-                : '❌ Error: ' + e.message;
-            if(statusEl) statusEl.textContent = msg;
+            if(statusEl) statusEl.textContent = '❌ Error: ' + e.message;
             return false;
         }
     }
@@ -4667,25 +4667,17 @@
             if(handled) return;
         }
         if(currentUser) {
-            try {
-                const row = await sbGetUser(currentUser);
-                if(row) {
-                    const chips = (typeof row.chips === 'number' && isFinite(row.chips)) ? row.chips : 0;
-                    userData = { chips, displayName: row.display_name, avatarUrl: row.avatar_url, discord: true };
-                    loginSuccess();
-                    if(userData.displayName && userData.avatarUrl) {
-                        injectDiscordAvatar(userData.displayName, userData.avatarUrl);
-                    }
-                } else {
-                    // Supabase returned nothing — likely RLS is on or table missing
-                    console.warn('[SwarmBet] Could not load user from Supabase. Check RLS settings.');
-                    localStorage.removeItem('swarm_user');
-                    currentUser = null;
+            const row = await sbGetUser(currentUser);
+            if(row) {
+                const chips = (typeof row.chips === 'number' && isFinite(row.chips)) ? row.chips : 0;
+                userData = { chips, displayName: row.display_name, avatarUrl: row.avatar_url, discord: true };
+                loginSuccess();
+                if(userData.displayName && userData.avatarUrl) {
+                    injectDiscordAvatar(userData.displayName, userData.avatarUrl);
                 }
-            } catch(e) {
-                console.error('[SwarmBet] Auto-login failed:', e.message);
-                localStorage.removeItem('swarm_user');
-                currentUser = null;
+            } else {
+                // Supabase returned nothing — likely RLS is on or table missing
+                console.warn('[SwarmBet] Could not load user from Supabase. Check RLS settings.');
             }
         }
     };
