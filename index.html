@@ -1878,9 +1878,75 @@
 <div id="win-container"></div>
 
 <script>
-    const DB_URL = "https://casbss-c75a0-default-rtdb.europe-west1.firebasedatabase.app/users";
-    const PROMO_URL = "https://casbss-c75a0-default-rtdb.europe-west1.firebasedatabase.app/promos";
+    // ── Supabase config ──
+    const SUPABASE_URL  = "https://slcvdcfjarjugibnjkdh.supabase.co";
+    const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNsY3ZkY2ZqYXJqdWdpYmpua2RoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQyMDI1NzEsImV4cCI6MjA4OTc3ODU3MX0.DY3NN9swWDFv_OgnHY-shLRajhrtRTKGmBIV-rMsKwY";
+    const SB_REST       = SUPABASE_URL + "/rest/v1";
+    const SB_HEADERS    = {
+        "apikey":        SUPABASE_ANON,
+        "Authorization": "Bearer " + SUPABASE_ANON,
+        "Content-Type":  "application/json",
+        "Prefer":        "return=representation",
+    };
     const DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1475155012266098688/gN9IvDw1VACuP9wrUJ6jjpxsfbyTC0_laPXcSI4OE1s9wIlbhFN58XoEpnju-TNm-uZb";
+
+    // ── Supabase helpers ──
+    async function sbGetUser(discordId) {
+        const r = await fetch(`${SB_REST}/users?discord_id=eq.${discordId}&select=*`, {headers: SB_HEADERS});
+        const rows = await r.json();
+        return rows && rows[0] ? rows[0] : null;
+    }
+    async function sbUpsertUser(discordId, displayName, avatarUrl, chips) {
+        const upsertHeaders = {...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"};
+        const r = await fetch(`${SB_REST}/users`, {
+            method: "POST", headers: upsertHeaders,
+            body: JSON.stringify({discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0})
+        });
+        const rows = await r.json();
+        return rows && rows[0] ? rows[0] : null;
+    }
+    async function sbSaveUser(discordId, data) {
+        const chips = typeof data.chips === "number" && isFinite(data.chips) ? data.chips : 0;
+        // Fetch current Supabase value first — never overwrite with a LOWER balance
+        // (prevents bot deposits being wiped out by a stale in-memory save)
+        try {
+            const fresh = await sbGetUser(discordId);
+            const safeChips = fresh && typeof fresh.chips === 'number' ? Math.max(chips, fresh.chips) : chips;
+            await fetch(`${SB_REST}/users?discord_id=eq.${discordId}`, {
+                method: "PATCH", headers: SB_HEADERS,
+                body: JSON.stringify({
+                    chips: safeChips,
+                    display_name: data.displayName || data.display_name,
+                    avatar_url: data.avatarUrl || data.avatar_url,
+                    updated_at: new Date().toISOString()
+                })
+            });
+            // Keep in-memory in sync too
+            if(safeChips !== chips && _realUserData) {
+                _realUserData.chips = safeChips;
+                if(userData) userData.chips = safeChips;
+            }
+        } catch(e) {
+            console.warn('[SwarmBet] sbSaveUser error:', e);
+        }
+    }
+    async function sbGetPromo(code) {
+        const r = await fetch(`${SB_REST}/promos?code=eq.${encodeURIComponent(code)}&select=*`, {headers: SB_HEADERS});
+        const rows = await r.json();
+        return rows && rows[0] ? rows[0] : null;
+    }
+    async function sbCreatePromo(code, val) {
+        const upsertHeaders = {...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"};
+        await fetch(`${SB_REST}/promos`, {method:"POST", headers: upsertHeaders, body: JSON.stringify({code, val})});
+    }
+    async function sbCheckPromoUsed(code, discordId) {
+        const r = await fetch(`${SB_REST}/promo_used?code=eq.${encodeURIComponent(code)}&discord_id=eq.${discordId}&select=id`, {headers: SB_HEADERS});
+        const rows = await r.json();
+        return rows && rows.length > 0;
+    }
+    async function sbMarkPromoUsed(code, discordId) {
+        await fetch(`${SB_REST}/promo_used`, {method:"POST", headers: SB_HEADERS, body: JSON.stringify({code, discord_id: discordId})});
+    }
     
     let currentUser = localStorage.getItem('swarm_user');
     let _realUserData = null; // Always points to the plain Firebase object (no Proxy)
@@ -2003,14 +2069,24 @@
             const discordUsername = 'discord_' + dcUser.id;
             const displayName = dcUser.username + (dcUser.discriminator && dcUser.discriminator !== '0' ? '#' + dcUser.discriminator : '');
             const avatarUrl = dcUser.avatar ? `https://cdn.discordapp.com/avatars/${dcUser.id}/${dcUser.avatar}.png` : `https://cdn.discordapp.com/embed/avatars/${parseInt(dcUser.id) % 6}.png`;
-            const res = await fetch(`${DB_URL}/${discordUsername}.json`);
-            let user = await res.json();
-            if(!user) {
-                user = { chips: 0, discord: true, displayName, avatarUrl };
-                await fetch(`${DB_URL}/${discordUsername}.json`, { method: 'PUT', body: JSON.stringify(user) });
-            } else { user.displayName = displayName; user.avatarUrl = avatarUrl; user.discord = true; }
-            currentUser = discordUsername; userData = user;
-            localStorage.setItem('swarm_user', discordUsername);
+            // Fetch or create user in Supabase
+            let row = await sbGetUser(dcUser.id);
+            if(!row) {
+                row = await sbUpsertUser(dcUser.id, displayName, avatarUrl, 0);
+            } else {
+                // Update display name + avatar on every login
+                await fetch(`${SB_REST}/users?discord_id=eq.${dcUser.id}`, {
+                    method: "PATCH", headers: SB_HEADERS,
+                    body: JSON.stringify({display_name: displayName, avatar_url: avatarUrl})
+                });
+                row.display_name = displayName;
+                row.avatar_url   = avatarUrl;
+            }
+            // Normalise row to the shape the rest of the app expects
+            const user = { chips: row.chips ?? 0, displayName: row.display_name || displayName, avatarUrl: row.avatar_url || avatarUrl, discord: true };
+            currentUser = dcUser.id;  // store plain Discord ID (no discord_ prefix)
+            userData = user;
+            localStorage.setItem('swarm_user', dcUser.id);
             loginSuccess();
             injectDiscordAvatar(displayName, avatarUrl);
             return true;
@@ -2048,18 +2124,8 @@
 
     // --- AUTH & CORE ---
     async function auth(type) {
-        const u = document.getElementById('user').value.trim(), p = document.getElementById('pass').value;
-        if(!u || !p) return;
-        const res = await fetch(DB_URL + ".json"), users = await res.json() || {};
-        if(type === 'reg') {
-            if(users[u]) return alert("Taken!");
-            userData = { password: p, chips: 0 };
-            await fetch(`${DB_URL}/${u}.json`, { method: 'PUT', body: JSON.stringify(userData) });
-            alert("Registered!");
-        } else {
-            if(users[u] && users[u].password === p) { currentUser = u; userData = users[u]; localStorage.setItem('swarm_user', u); loginSuccess(); }
-            else alert("Login failed! Check your credentials.");
-        }
+        // Legacy password login removed — use Discord login instead
+        alert("Please use the Discord login button.");
     }
 
     function loginSuccess() {
@@ -2096,8 +2162,7 @@
         window._balancePollTimer = setInterval(async () => {
             if (!currentUser || fpEnabled) return;
             try {
-                const r = await fetch(`${DB_URL}/${currentUser}.json`);
-                const fresh = await r.json();
+                const fresh = await sbGetUser(currentUser);
                 if (fresh && typeof fresh.chips === 'number' && isFinite(fresh.chips)) {
                     // Only update if balance changed (admin deposit/withdraw)
                     const cur = _realUserData ? _realUserData.chips : 0;
@@ -2443,7 +2508,7 @@
         }
         // Sync anticheat snapshot on every legitimate updateUI call
         if(_acEnabled) acLegitChange(_realUserData ? _realUserData.chips : userData.chips);
-        fetch(`${DB_URL}/${currentUser}.json`, { method: 'PUT', body: JSON.stringify(_realUserData) });
+        sbSaveUser(currentUser, _realUserData);
 
         // Dim FP button when any game is active (prevents confusion)
         const fpBtn = document.getElementById('fp-topbtn');
@@ -2661,23 +2726,20 @@
     async function createPromo() {
         const code = document.getElementById('new-code').value.toUpperCase().trim(), val = parseInt(document.getElementById('code-val').value);
         if(!code || isNaN(val)) return;
-        await fetch(`${PROMO_URL}/${code}.json`, { method: 'PUT', body: JSON.stringify({val}) });
+        await sbCreatePromo(code, val);
         alert("Promo created!");
     }
 
     async function redeemCode() {
         const code = document.getElementById('promo-input').value.toUpperCase().trim();
         if(!code) return toast('Enter a code!', 'warn');
-        // Check if this user already redeemed this code
-        const usedKey = `${PROMO_URL}/used/${currentUser}_${code}.json`;
-        const usedRes = await fetch(usedKey), usedData = await usedRes.json();
-        if(usedData) return toast('You already redeemed this code!', 'error');
-        const res = await fetch(`${PROMO_URL}/${code}.json`), data = await res.json();
-        if(data && data.val) {
-            // Mark as used
-            await fetch(usedKey, { method: 'PUT', body: JSON.stringify({ by: currentUser, at: Date.now() }) });
-            addChips(data.val); updateUI();
-            toast('✅ Code redeemed! +' + data.val + ' ★', 'success');
+        const alreadyUsed = await sbCheckPromoUsed(code, currentUser);
+        if(alreadyUsed) return toast('You already redeemed this code!', 'error');
+        const promo = await sbGetPromo(code);
+        if(promo && promo.val) {
+            await sbMarkPromoUsed(code, currentUser);
+            addChips(promo.val); updateUI();
+            toast('\u2705 Code redeemed! +' + promo.val + ' \u2605', 'success');
         } else {
             toast('Invalid or expired code!', 'error');
         }
@@ -2696,11 +2758,12 @@
         const target = /^\d{17,20}$/.test(raw) ? 'discord_' + raw : raw;
         const amount = parseInt(document.getElementById('adm-amount').value);
         if(!target || isNaN(amount)) return alert('Please enter a username/ID and amount!');
-        const res = await fetch(`${DB_URL}/${target}.json`), tData = await res.json();
-        if(!tData) { play('error'); return alert('Player not found!'); }
-        const oldChips = tData.chips || 0;
-        tData.chips = oldChips + amount;
-        await fetch(`${DB_URL}/${target}.json`, { method: 'PUT', body: JSON.stringify(tData) });
+        const tRow = await sbGetUser(target.replace('discord_',''));
+        if(!tRow) { play('error'); return alert('Player not found!'); }
+        const oldChips = tRow.chips || 0;
+        const newChips = oldChips + amount;
+        await fetch(`${SB_REST}/users?discord_id=eq.${target.replace('discord_','')}`, {method:'PATCH',headers:SB_HEADERS,body:JSON.stringify({chips:newChips})});
+        const tData = {...tRow, chips: newChips};
         if(target === currentUser) { if(_realUserData) _realUserData.chips = tData.chips; userData.chips = tData.chips; if(_acEnabled) acLegitChange(tData.chips); updateUI(); }
         
         // Log to Discord
@@ -2722,11 +2785,11 @@
         const newBal = parseInt(document.getElementById('adm-reset-amount').value) || 0;
         if(!target) return alert('Please enter a username or Discord ID!');
         if(!confirm(`Really reset balance for player ${raw} to ${newBal} ★?`)) return;
-        const res = await fetch(`${DB_URL}/${target}.json`), tData = await res.json();
-        if(!tData) { play('error'); return alert('Player not found!'); }
-        const oldBal = tData.chips || 0;
-        tData.chips = newBal;
-        await fetch(`${DB_URL}/${target}.json`, { method: 'PUT', body: JSON.stringify(tData) });
+        const tRow = await sbGetUser(target.replace('discord_',''));
+        if(!tRow) { play('error'); return alert('Player not found!'); }
+        const oldBal = tRow.chips || 0;
+        await fetch(`${SB_REST}/users?discord_id=eq.${target.replace('discord_','')}`, {method:'PATCH',headers:SB_HEADERS,body:JSON.stringify({chips:newBal})});
+        const tData = {...tRow, chips: newBal};
         if(target === currentUser) { if(_realUserData) _realUserData.chips = newBal; userData.chips = newBal; if(_acEnabled) acLegitChange(newBal); updateUI(); }
         
         // Log to Discord
@@ -2758,22 +2821,13 @@
         }
         
         // Fetch target player data
-        const res = await fetch(`${DB_URL}/${target}.json`);
-        const tData = await res.json();
-        
-        if(!tData) {
-            play('error');
-            return alert('Player not found!');
-        }
-        
-        // Get player display name
-        const playerName = tData.username || tData.discordName || raw;
-        const oldBalance = tData.chips || 0;
+        const tRow = await sbGetUser(target.replace('discord_',''));
+        if(!tRow) { play('error'); return alert('Player not found!'); }
+        const playerName = tRow.display_name || raw;
+        const oldBalance = tRow.chips || 0;
         const newBalance = oldBalance + amount;
-        
-        // Update player balance
-        tData.chips = newBalance;
-        await fetch(`${DB_URL}/${target}.json`, { method: 'PUT', body: JSON.stringify(tData) });
+        await fetch(`${SB_REST}/users?discord_id=eq.${target.replace('discord_','')}`, {method:'PATCH',headers:SB_HEADERS,body:JSON.stringify({chips:newBalance})});
+        const tData = {...tRow, chips: newBalance};
         
         // Update UI if it's current user
         if(target === currentUser) {
@@ -2817,17 +2871,10 @@
         }
         
         // Fetch target player data
-        const res = await fetch(`${DB_URL}/${target}.json`);
-        const tData = await res.json();
-        
-        if(!tData) {
-            play('error');
-            return alert('Player not found!');
-        }
-        
-        // Get player display name
-        const playerName = tData.username || tData.discordName || raw;
-        const oldBalance = tData.chips || 0;
+        const tRow = await sbGetUser(target.replace('discord_',''));
+        if(!tRow) { play('error'); return alert('Player not found!'); }
+        const playerName = tRow.display_name || raw;
+        const oldBalance = tRow.chips || 0;
         
         // Check if player has enough balance
         if(oldBalance < amount) {
@@ -2843,8 +2890,7 @@
         }
         
         // Update player balance
-        tData.chips = newBalance;
-        await fetch(`${DB_URL}/${target}.json`, { method: 'PUT', body: JSON.stringify(tData) });
+        // chips already updated via Supabase above
         
         // Update UI if it's current user
         if(target === currentUser) {
@@ -4406,7 +4452,7 @@
         // Reset to snapshot value and save
         if(userData) {
             if(_realUserData) _realUserData.chips = _acChipsSnapshot; if(userData) userData.chips = _acChipsSnapshot;
-            fetch(`${DB_URL}/${currentUser}.json`, { method: 'PUT', body: JSON.stringify(userData) });
+            sbSaveUser(currentUser, _realUserData || userData);
         }
     }
 
@@ -4600,13 +4646,17 @@
             if(handled) return;
         }
         if(currentUser) {
-            const r = await fetch(`${DB_URL}/${currentUser}.json`);
-            userData = await r.json();
-            if(userData) {
+            const row = await sbGetUser(currentUser);
+            if(row) {
+                const chips = (typeof row.chips === 'number' && isFinite(row.chips)) ? row.chips : 0;
+                userData = { chips, displayName: row.display_name, avatarUrl: row.avatar_url, discord: true };
                 loginSuccess();
-                if(userData.discord && userData.displayName && userData.avatarUrl) {
+                if(userData.displayName && userData.avatarUrl) {
                     injectDiscordAvatar(userData.displayName, userData.avatarUrl);
                 }
+            } else {
+                // Supabase returned nothing — likely RLS is on or table missing
+                console.warn('[SwarmBet] Could not load user from Supabase. Check RLS settings.');
             }
         }
     };
