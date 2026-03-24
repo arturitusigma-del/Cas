@@ -1892,18 +1892,36 @@
 
     // ── Supabase helpers ──
     async function sbGetUser(discordId) {
-        const r = await fetch(`${SB_REST}/users?discord_id=eq.${discordId}&select=*`, {headers: SB_HEADERS});
-        const rows = await r.json();
-        return rows && rows[0] ? rows[0] : null;
+        try {
+            const r = await fetch(`${SB_REST}/users?discord_id=eq.${discordId}&select=*`, {headers: SB_HEADERS});
+            if (!r.ok) {
+                console.error('[SwarmBet] sbGetUser HTTP error:', r.status, r.statusText);
+                return null;
+            }
+            const rows = await r.json();
+            return rows && rows[0] ? rows[0] : null;
+        } catch(e) {
+            console.error('[SwarmBet] sbGetUser failed (network/CORS?):', e.message);
+            return null;
+        }
     }
     async function sbUpsertUser(discordId, displayName, avatarUrl, chips) {
-        const upsertHeaders = {...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"};
-        const r = await fetch(`${SB_REST}/users`, {
-            method: "POST", headers: upsertHeaders,
-            body: JSON.stringify({discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0})
-        });
-        const rows = await r.json();
-        return rows && rows[0] ? rows[0] : null;
+        try {
+            const upsertHeaders = {...SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"};
+            const r = await fetch(`${SB_REST}/users`, {
+                method: "POST", headers: upsertHeaders,
+                body: JSON.stringify({discord_id: discordId, display_name: displayName, avatar_url: avatarUrl, chips: chips ?? 0})
+            });
+            if (!r.ok) {
+                console.error('[SwarmBet] sbUpsertUser HTTP error:', r.status, r.statusText);
+                return null;
+            }
+            const rows = await r.json();
+            return rows && rows[0] ? rows[0] : null;
+        } catch(e) {
+            console.error('[SwarmBet] sbUpsertUser failed (network/CORS?):', e.message);
+            return null;
+        }
     }
     async function sbSaveUser(discordId, data) {
         const chips = typeof data.chips === "number" && isFinite(data.chips) ? data.chips : 0;
@@ -2092,7 +2110,10 @@
             return true;
         } catch(e) {
             console.error('Discord OAuth error:', e);
-            if(statusEl) statusEl.textContent = '❌ Error: ' + e.message;
+            const msg = e.message.includes('fetch') 
+                ? '❌ Network error — check Supabase RLS or table setup. See console for details.'
+                : '❌ Error: ' + e.message;
+            if(statusEl) statusEl.textContent = msg;
             return false;
         }
     }
@@ -4646,17 +4667,25 @@
             if(handled) return;
         }
         if(currentUser) {
-            const row = await sbGetUser(currentUser);
-            if(row) {
-                const chips = (typeof row.chips === 'number' && isFinite(row.chips)) ? row.chips : 0;
-                userData = { chips, displayName: row.display_name, avatarUrl: row.avatar_url, discord: true };
-                loginSuccess();
-                if(userData.displayName && userData.avatarUrl) {
-                    injectDiscordAvatar(userData.displayName, userData.avatarUrl);
+            try {
+                const row = await sbGetUser(currentUser);
+                if(row) {
+                    const chips = (typeof row.chips === 'number' && isFinite(row.chips)) ? row.chips : 0;
+                    userData = { chips, displayName: row.display_name, avatarUrl: row.avatar_url, discord: true };
+                    loginSuccess();
+                    if(userData.displayName && userData.avatarUrl) {
+                        injectDiscordAvatar(userData.displayName, userData.avatarUrl);
+                    }
+                } else {
+                    // Supabase returned nothing — likely RLS is on or table missing
+                    console.warn('[SwarmBet] Could not load user from Supabase. Check RLS settings.');
+                    localStorage.removeItem('swarm_user');
+                    currentUser = null;
                 }
-            } else {
-                // Supabase returned nothing — likely RLS is on or table missing
-                console.warn('[SwarmBet] Could not load user from Supabase. Check RLS settings.');
+            } catch(e) {
+                console.error('[SwarmBet] Auto-login failed:', e.message);
+                localStorage.removeItem('swarm_user');
+                currentUser = null;
             }
         }
     };
